@@ -1,12 +1,13 @@
 package user
 
 import (
+	"context"
 	"crypto/hmac"
-	"math/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v4"
 
+	"github.com/GetStream/stream-chat-go/v5"
 	"github.com/KAsare1/Kodefx-server/cmd/models"
 	"github.com/gorilla/mux"
 	"golang.org/x/crypto/bcrypt"
@@ -27,6 +29,8 @@ type Handler struct {
 func NewHandler(db *gorm.DB) *Handler {
 	return &Handler{db: db}
 }
+
+
 
 // RegisterRoutes sets up all user-related routes
 func (h *Handler) RegisterRoutes(router *mux.Router) {
@@ -74,7 +78,7 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Generate Access Token
+    // Generate Access Token for your API
     accessToken, err := generateJWT(user.ID, 15) // Access token valid for 15 minutes
     if err != nil {
         http.Error(w, "Error generating access token", http.StatusInternalServerError)
@@ -95,21 +99,37 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    // Initialize Stream Chat Client
+	API_KEY := os.Getenv("STREAM_API_KEY")
+	API_SECRET := os.Getenv("STREAM_API_SECRET")
+    streamClient, err := stream_chat.NewClient(API_KEY, API_SECRET)
+    if err != nil {
+        http.Error(w, "Error initializing Stream client", http.StatusInternalServerError)
+        return
+    }
+
+    // Convert user.ID to string
+    userIDStr := fmt.Sprintf("%d", user.ID)
+
+    // Generate a Stream Chat token
+    streamToken, err := streamClient.CreateToken(userIDStr, time.Now().Add(time.Hour * 24 * 365)) 
+    if err != nil {
+        http.Error(w, "Error generating Stream token", http.StatusInternalServerError)
+        return
+    }
+
     // Respond with tokens
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(map[string]interface{}{
-        "message":      "Login successful",
-        "access_token": accessToken,
-        "refresh_token": refreshToken,
-        "user_id":      user.ID,
+        "message":        "Login successful",
+        "access_token":   accessToken,
+        "refresh_token":  refreshToken,
+        "user_id":        user.ID,
+        "stream_token":   streamToken, // Stream token for authenticating with the chat service
     })
 }
 
 
-
-
-
-// handleRegister handles new user registration
 func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
     var registerRequest struct {
         FullName       string `json:"full_name"`
@@ -175,6 +195,27 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+	API_KEY := os.Getenv("STREAM_API_KEY")
+	API_SECRET := os.Getenv("STREAM_API_SECRET")
+
+    streamClient, err := stream_chat.NewClient(API_KEY, API_SECRET)
+    if err != nil {
+        http.Error(w, "Error initializing Stream client", http.StatusInternalServerError)
+        return
+    }
+
+	ctx := context.Background()
+	streamUser := &stream_chat.User{
+		ID:   fmt.Sprintf("%d", user.ID), // Convert user.ID to string
+		Name: user.FullName,
+	}
+	_, err = streamClient.UpsertUser(ctx, streamUser)
+	if err != nil {
+		http.Error(w, "Error creating user in Stream Chat", http.StatusInternalServerError)
+		return
+	}
+
+    // Respond with success message
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(map[string]interface{}{
         "message": "User registered successfully",

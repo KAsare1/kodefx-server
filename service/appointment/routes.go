@@ -30,6 +30,8 @@ func (h *AppointmentHandler) RegisterRoutes(router *mux.Router) {
 }
 
 
+
+
 func (h *AppointmentHandler) BookAppointment(w http.ResponseWriter, r *http.Request) {
     var bookingRequest struct {
         TraderID       uint    `json:"trader_id"`

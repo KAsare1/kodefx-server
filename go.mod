@@ -1,6 +1,6 @@
 module github.com/KAsare1/Kodefx-server
 
-go 1.23
+go 1.23.3
 
 require (
 	github.com/GetStream/stream-chat-go/v5 v5.8.1

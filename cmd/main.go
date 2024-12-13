@@ -22,27 +22,6 @@ func main() {    DB, err := db.NewPSQLStorage()
     defer sqlDB.Close()
     log.Println("Connected to the database")
 
-    tables := []interface{}{
-        &models.Like{},
-        &models.Comment{},
-        &models.Share{},
-        &models.Image{},
-        &models.Post{},
-        &models.Appointment{},
-        &models.Availability{},
-        &models.Expert{},
-        &models.User{},
-		&models.Message{},
-    }
-
-    // Drop tables
-    log.Println("Dropping existing tables...")
-    for _, table := range tables {
-        if err := DB.Migrator().DropTable(table); err != nil {
-            log.Printf("Warning dropping table: %v", err)
-        }
-    }
-
     // Create tables in correct order
     migrations := map[interface{}]string{
         &models.User{}: "User",

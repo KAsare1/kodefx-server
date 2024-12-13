@@ -1,4 +1,4 @@
-// package chats
+package chats
 
 // import (
 // 	"encoding/json"

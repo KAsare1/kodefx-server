@@ -1,11 +1,11 @@
 package user
 
 import (
-	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v4"
+	"gopkg.in/gomail.v2"
 
 	"github.com/GetStream/stream-chat-go/v5"
 	"github.com/KAsare1/Kodefx-server/cmd/models"
@@ -40,8 +41,10 @@ func (h *Handler) RegisterRoutes(router *mux.Router) {
 	router.HandleFunc("/users/{id}", h.GetUser).Methods("GET")
 	router.HandleFunc("/users/{id}", h.UpdateUser).Methods("PUT")
 	router.HandleFunc("/users/{id}", h.DeleteUser).Methods("DELETE")
+	router.HandleFunc("/user/verify", h.verifyUser).Methods("POST")
 	router.HandleFunc("/refresh", h.handleRefreshToken).Methods("POST")
 	router.HandleFunc("/password/reset-request", h.handlePasswordResetRequest).Methods("POST")
+	router.HandleFunc("/verify-reset-token", h.handleVerifyResetToken).Methods("POST")
 	router.HandleFunc("/password/reset", h.handlePasswordReset).Methods("POST")
 	router.HandleFunc("/experts", h.GetExperts).Methods("GET")
 	router.HandleFunc("/experts/{id}", h.GetExpert).Methods("GET")
@@ -79,7 +82,7 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
     }
 
     // Generate Access Token for your API
-    accessToken, err := generateJWT(user.ID, 15) // Access token valid for 15 minutes
+    accessToken, err := generateJWT(user.ID, 7500) 
     if err != nil {
         http.Error(w, "Error generating access token", http.StatusInternalServerError)
         return
@@ -132,14 +135,17 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
     var registerRequest struct {
-        FullName       string `json:"full_name"`
-        Email          string `json:"email"`
-        Password       string `json:"password"`
-        Phone          string `json:"phone"`
-        Role           string `json:"role"`
-        Expertise      string `json:"expertise,omitempty"`
-        Certifications string `json:"certifications,omitempty"`
-        Bio            string `json:"bio,omitempty"`
+        FullName          string `json:"full_name"`
+        Email             string `json:"email"`
+        Password          string `json:"password"`
+        Phone             string `json:"phone"`
+        Role              string `json:"role"`
+        Expertise         string `json:"expertise,omitempty"`
+        Bio               string `json:"bio,omitempty"`
+        CertificationFiles []struct {
+            FileName string `json:"file_name"`
+            FilePath string `json:"file_path"`
+        } `json:"certification_files,omitempty"`
     }
 
     if err := json.NewDecoder(r.Body).Decode(&registerRequest); err != nil {
@@ -154,17 +160,23 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    // Generate a 6-digit verification code
+    verificationCode := fmt.Sprintf("%06d", rand.Intn(1000000))
+    verificationExpiry := time.Now().Add(15 * time.Minute) // Code expires in 15 minutes
+
     // Begin a transaction
     tx := h.db.Begin()
 
     // Create user
     user := models.User{
-        FullName:      registerRequest.FullName,
-        Email:         registerRequest.Email,
-        PasswordHash:  string(passwordHash),
-        Phone:         registerRequest.Phone,
-        Role:          registerRequest.Role,
-        PhoneVerified: false,
+        FullName:            registerRequest.FullName,
+        Email:               registerRequest.Email,
+        PasswordHash:        string(passwordHash),
+        Phone:               registerRequest.Phone,
+        Role:                registerRequest.Role,
+        PhoneVerified:       false,
+        EmailVerificationCode: verificationCode,
+        VerificationExpiry:  verificationExpiry,
     }
 
     if err := tx.Create(&user).Error; err != nil {
@@ -176,16 +188,30 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
     // If the role is "expert", create an expert profile
     if registerRequest.Role == "expert" {
         expert := models.Expert{
-            UserID:         user.ID,
-            Expertise:      registerRequest.Expertise,
-            Certifications: registerRequest.Certifications,
-            Bio:            registerRequest.Bio,
+            UserID:    user.ID,
+            Expertise: registerRequest.Expertise,
+            Bio:       registerRequest.Bio,
         }
 
         if err := tx.Create(&expert).Error; err != nil {
             tx.Rollback()
             http.Error(w, "Error creating expert profile", http.StatusInternalServerError)
             return
+        }
+
+        // Add certification files
+        for _, file := range registerRequest.CertificationFiles {
+            certificationFile := models.CertificationFile{
+                ExpertID: expert.ID,
+                FileName: file.FileName,
+                FilePath: file.FilePath,
+            }
+
+            if err := tx.Create(&certificationFile).Error; err != nil {
+                tx.Rollback()
+                http.Error(w, "Error saving certification files", http.StatusInternalServerError)
+                return
+            }
         }
     }
 
@@ -195,33 +221,91 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-	API_KEY := os.Getenv("STREAM_API_KEY")
-	API_SECRET := os.Getenv("STREAM_API_SECRET")
-
-    streamClient, err := stream_chat.NewClient(API_KEY, API_SECRET)
-    if err != nil {
-        http.Error(w, "Error initializing Stream client", http.StatusInternalServerError)
-        return
-    }
-
-	ctx := context.Background()
-	streamUser := &stream_chat.User{
-		ID:   fmt.Sprintf("%d", user.ID), // Convert user.ID to string
-		Name: user.FullName,
-	}
-	_, err = streamClient.UpsertUser(ctx, streamUser)
-	if err != nil {
-		http.Error(w, "Error creating user in Stream Chat", http.StatusInternalServerError)
-		return
-	}
+    // Send verification email
+    go func() {
+        if err := sendVerificationEmail(user.Email, verificationCode); err != nil {
+            log.Printf("Error sending verification email: %v", err)
+        }
+    }()
 
     // Respond with success message
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(map[string]interface{}{
-        "message": "User registered successfully",
+        "message": "User registered successfully. Please check your email for verification code.",
         "user_id": user.ID,
     })
 }
+
+// sendVerificationEmail sends a verification email with the 6-digit code
+func sendVerificationEmail(email, code string) error {
+	// Load SMTP configuration from environment variables
+	smtpHost := os.Getenv("SMTP_HOST")
+	smtpPort := os.Getenv("SMTP_PORT")
+	smtpUser := os.Getenv("SMTP_USER")
+	smtpPass := os.Getenv("SMTP_PASS")
+
+	// Create a new email message
+	m := gomail.NewMessage()
+	m.SetHeader("From", smtpUser)
+	m.SetHeader("To", email)
+	m.SetHeader("Subject", "Email Verification Code")
+	m.SetBody("text/plain", fmt.Sprintf("Your verification code is: %s", code))
+
+	// Set up the dialer
+	port, err := strconv.Atoi(smtpPort)
+	if err != nil {
+		return fmt.Errorf("invalid SMTP port: %v", err)
+	}
+	d := gomail.NewDialer(smtpHost, port, smtpUser, smtpPass)
+
+	// Send the email
+	return d.DialAndSend(m)
+}
+
+
+
+
+func (h *Handler) verifyUser(w http.ResponseWriter, r *http.Request) {
+    var request struct {
+        Email string `json:"email"`
+        Code  string `json:"code"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
+
+    var user models.User
+    if err := h.db.Where("email = ?", request.Email).First(&user).Error; err != nil {
+        http.Error(w, "User not found", http.StatusNotFound)
+        return
+    }
+
+    // Check if the code matches and is not expired
+    if user.EmailVerificationCode != request.Code || time.Now().After(user.VerificationExpiry) {
+        http.Error(w, "Invalid or expired verification code", http.StatusUnauthorized)
+        return
+    }
+
+
+    user.EmailVerified = true
+    user.EmailVerificationCode = "" // Clear the code
+    user.VerificationExpiry = time.Time{}
+
+    if err := h.db.Save(&user).Error; err != nil {
+        http.Error(w, "Error updating user", http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{
+        "message": "Email verified successfully",
+    })
+}
+
+
+
 
 
 
@@ -259,6 +343,17 @@ func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(user)
 }
 
+
+func createDirectoryIfNotExist(path string) error {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			return fmt.Errorf("could not create directory %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+
 // UpdateUser updates user information
 func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	// Parse user ID from URL
@@ -269,14 +364,41 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse request body
-	var updateRequest struct {
-		FullName string `json:"full_name"`
-		Phone    string `json:"phone"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&updateRequest); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+	// Parse multipart form data
+	if err := r.ParseMultipartForm(10 << 20); err != nil { // Limit to 10MB
+		http.Error(w, "Error parsing form data", http.StatusBadRequest)
 		return
+	}
+
+	// Extract fields from form
+	fullName := r.FormValue("full_name")
+	phone := r.FormValue("phone")
+
+	// Extract the file from the form
+	file, handler, err := r.FormFile("profile_picture")
+	var filePath string
+	if err == nil { // File exists
+		defer file.Close()
+
+		// Validate and save the file
+		uploadPath := "uploads/images"
+		if err := createDirectoryIfNotExist(uploadPath); err != nil {
+			http.Error(w, "Error creating upload directory", http.StatusInternalServerError)
+			return
+		}
+
+		filePath = fmt.Sprintf("%s/%s", uploadPath, handler.Filename)
+		dst, err := os.Create(filePath)
+		if err != nil {
+			http.Error(w, "Error saving file", http.StatusInternalServerError)
+			return
+		}
+		defer dst.Close()
+
+		if _, err := io.Copy(dst, file); err != nil {
+			http.Error(w, "Error copying file", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// Find and update user
@@ -288,8 +410,15 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update fields
-	user.FullName = updateRequest.FullName
-	user.Phone = updateRequest.Phone
+	if fullName != "" {
+		user.FullName = fullName
+	}
+	if phone != "" {
+		user.Phone = phone
+	}
+	if filePath != "" {
+		user.ProfilePicturePath = filePath // Assuming a `ProfilePicturePath` field in `User` model
+	}
 
 	// Save updates
 	if err := h.db.Save(&user).Error; err != nil {
@@ -300,6 +429,8 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(user)
 }
+
+
 
 // DeleteUser removes a user
 func (h *Handler) DeleteUser(w http.ResponseWriter, r *http.Request) {
@@ -455,68 +586,88 @@ type PasswordResetToken struct {
 }
 
 func (h *Handler) handlePasswordResetRequest(w http.ResponseWriter, r *http.Request) {
-	var resetRequest struct {
-		Email string `json:"email"`
-	}
+    var resetRequest struct {
+        Email string `json:"email"`
+    }
 
-	if err := json.NewDecoder(r.Body).Decode(&resetRequest); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
+    if err := json.NewDecoder(r.Body).Decode(&resetRequest); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
 
-	// Find user by email
-	var user models.User
-	result := h.db.Where("email = ?", resetRequest.Email).First(&user)
-	if result.Error != nil {
-		// Deliberately vague response to prevent email enumeration
-		http.Error(w, "If an account exists, a reset link will be sent", http.StatusOK)
-		return
-	}
+    // Find user by email
+    var user models.User
+    result := h.db.Where("email = ?", resetRequest.Email).First(&user)
+    if result.Error != nil {
+        // Deliberately vague response to prevent email enumeration
+        http.Error(w, "If an account exists, a reset link will be sent", http.StatusOK)
+        return
+    }
 
-	// Generate a secure reset token
-	resetToken := generateSixDigitToken()
-	// Begin a transaction
-	tx := h.db.Begin()
+    // Generate a secure 6-digit reset token
+    resetToken := fmt.Sprintf("%06d", rand.Intn(1000000))
 
-	// Create or update password reset token
-	passwordResetToken := PasswordResetToken{
-		UserID:    user.ID,
-		Token:     resetToken,
-		ExpiresAt: time.Now().Add(5 * time.Minute), 
-	}
+    // Begin a transaction
+    tx := h.db.Begin()
 
-	// Delete any existing reset tokens for this user
-	if err := tx.Where("user_id = ?", user.ID).Delete(&PasswordResetToken{}).Error; err != nil {
-		tx.Rollback()
-		http.Error(w, "Error processing reset request", http.StatusInternalServerError)
-		return
-	}
+    // Delete any existing reset tokens for this user
+    if err := tx.Where("user_id = ?", user.ID).Delete(&models.PasswordResetToken{}).Error; err != nil {
+        tx.Rollback()
+        http.Error(w, "Error processing reset request", http.StatusInternalServerError)
+        return
+    }
 
-	// Create new reset token
-	if err := tx.Create(&passwordResetToken).Error; err != nil {
-		tx.Rollback()
-		http.Error(w, "Error creating reset token", http.StatusInternalServerError)
-		return
-	}
+    // Create new reset token
+    passwordResetToken := models.PasswordResetToken{
+        UserID:    user.ID,
+        Token:     resetToken,
+        ExpiresAt: time.Now().Add(5 * time.Minute),
+    }
 
-	// Commit transaction
-	if err := tx.Commit().Error; err != nil {
-		http.Error(w, "Error processing reset request", http.StatusInternalServerError)
-		return
-	}
+    if err := tx.Create(&passwordResetToken).Error; err != nil {
+        tx.Rollback()
+        http.Error(w, "Error creating reset token", http.StatusInternalServerError)
+        return
+    }
 
-	println(passwordResetToken.Token)
+    // Commit transaction
+    if err := tx.Commit().Error; err != nil {
+        http.Error(w, "Error processing reset request", http.StatusInternalServerError)
+        return
+    }
 
-	// TODO: Send email using a dedicated email service
+    // Send the reset code via email
+    // subject := "Password Reset Request"
+    // body := fmt.Sprintf(`
+    //     Hi %s,
+
+    //     You requested a password reset. Use the code below to reset your password:
+
+    //     %s
+
+    //     If you did not request this, please ignore this email. The code is valid for 5 minutes.
+
+    //     Best regards,
+    //     Your Team
+    // `, user.FullName, resetToken)
+
+    if err := sendVerificationEmail(resetRequest.Email, resetToken); err != nil {
+        http.Error(w, "Error sending email", http.StatusInternalServerError)
+        return
+    }
+
+    // Respond to the user
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(map[string]string{
         "message": "Reset code has been sent to your email",
     })
 }
 
+
+
 func (h *Handler) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 	var resetRequest struct {
-		Token    string `json:"token"`
+		Email    string `json:"email"`
 		Password string `json:"password"`
 	}
 
@@ -526,31 +677,23 @@ func (h *Handler) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate password strength (basic example)
-	if len(resetRequest.Password) < 8 {
-		http.Error(w, "Password must be at least 8 characters long", http.StatusBadRequest)
+	if len(resetRequest.Password) < 6 {
+		http.Error(w, "Password must be at least 6 characters long", http.StatusBadRequest)
 		return
 	}
 
 	// Begin a transaction
 	tx := h.db.Begin()
 
-	// Find and validate reset token
-	var resetToken PasswordResetToken
-	if err := tx.Where("token = ? AND expires_at > ?", resetRequest.Token, time.Now()).First(&resetToken).Error; err != nil {
-		tx.Rollback()
-		http.Error(w, "Invalid or expired reset token", http.StatusUnauthorized)
-		return
-	}
-
-	// Find the user
+	// Find the user by email
 	var user models.User
-	if err := tx.First(&user, resetToken.UserID).Error; err != nil {
+	if err := tx.Where("email = ?", resetRequest.Email).First(&user).Error; err != nil {
 		tx.Rollback()
 		http.Error(w, "User not found", http.StatusNotFound)
 		return
 	}
 
-	// Hash new password
+	// Hash the new password
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(resetRequest.Password), bcrypt.DefaultCost)
 	if err != nil {
 		tx.Rollback()
@@ -558,7 +701,7 @@ func (h *Handler) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update user's password
+	// Update the user's password
 	user.PasswordHash = string(passwordHash)
 	if err := tx.Save(&user).Error; err != nil {
 		tx.Rollback()
@@ -566,14 +709,7 @@ func (h *Handler) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Delete the used reset token
-	if err := tx.Delete(&resetToken).Error; err != nil {
-		tx.Rollback()
-		http.Error(w, "Error cleaning up reset token", http.StatusInternalServerError)
-		return
-	}
-
-	// Commit transaction
+	// Commit the transaction
 	if err := tx.Commit().Error; err != nil {
 		http.Error(w, "Error processing password reset", http.StatusInternalServerError)
 		return
@@ -585,12 +721,52 @@ func (h *Handler) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// generatePasswordResetToken creates a secure, unique reset token
-func generateSixDigitToken() string {
-    // Generate a random 6-digit number
-    token := rand.Intn(900000) + 100000 // Ensures 6 digits (100000-999999)
-    return fmt.Sprintf("%06d", token)
+
+
+
+type TokenVerificationRequest struct {
+	Email string `json:"email"`
+	Token string `json:"token"`
 }
+
+func (h *Handler) handleVerifyResetToken(w http.ResponseWriter, r *http.Request) {
+	var req TokenVerificationRequest
+
+	// Decode the incoming request payload
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Find the user by email
+	var user models.User
+	if err := h.db.Where("email = ?", req.Email).First(&user).Error; err != nil {
+		// Deliberately vague response to avoid revealing user existence
+		http.Error(w, "Invalid email or token", http.StatusBadRequest)
+		return
+	}
+
+	// Find the reset token for the user
+	var resetToken models.PasswordResetToken
+	if err := h.db.Where("user_id = ? AND token = ?", user.ID, req.Token).First(&resetToken).Error; err != nil {
+		http.Error(w, "Invalid email or token", http.StatusBadRequest)
+		return
+	}
+
+	// Check if the token is expired
+	if time.Now().After(resetToken.ExpiresAt) {
+		http.Error(w, "Token expired", http.StatusBadRequest)
+		return
+	}
+
+	// Token is valid; respond with success
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "Token is valid",
+	})
+}
+
+
 
 func (h *Handler) GetExperts(w http.ResponseWriter, r *http.Request) {
 	// Parse query parameters
@@ -655,46 +831,72 @@ func (h *Handler) GetExpert(w http.ResponseWriter, r *http.Request) {
 
 // UpdateExpert allows updating expert profile information
 func (h *Handler) UpdateExpert(w http.ResponseWriter, r *http.Request) {
-	// Parse expert ID from URL
-	vars := mux.Vars(r)
-	expertID, err := strconv.ParseUint(vars["id"], 10, 64)
-	if err != nil {
-		http.Error(w, "Invalid expert ID", http.StatusBadRequest)
-		return
-	}
+    // Parse expert ID from URL
+    vars := mux.Vars(r)
+    expertID, err := strconv.ParseUint(vars["id"], 10, 64)
+    if err != nil {
+        http.Error(w, "Invalid expert ID", http.StatusBadRequest)
+        return
+    }
 
-	// Parse request body
-	var updateRequest struct {
-		Expertise      string `json:"expertise"`
-		Certifications string `json:"certifications"`
-		Bio            string `json:"bio"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&updateRequest); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
+    // Parse request body
+    var updateRequest struct {
+        Expertise          string `json:"expertise"`
+        Bio                string `json:"bio"`
+        CertificationFiles []struct {
+            FileName string `json:"file_name"`
+            FilePath string `json:"file_path"`
+        } `json:"certification_files"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&updateRequest); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
 
-	// Find and update expert
-	var expert models.Expert
-	result := h.db.First(&expert, expertID)
-	if result.Error != nil {
-		http.Error(w, "Expert not found", http.StatusNotFound)
-		return
-	}
+    // Find expert
+    var expert models.Expert
+    if result := h.db.Preload("CertificationFiles").First(&expert, expertID); result.Error != nil {
+        http.Error(w, "Expert not found", http.StatusNotFound)
+        return
+    }
 
-	// Update fields
-	expert.Expertise = updateRequest.Expertise
-	expert.Certifications = updateRequest.Certifications
-	expert.Bio = updateRequest.Bio
+    // Update fields
+    expert.Expertise = updateRequest.Expertise
+    expert.Bio = updateRequest.Bio
 
-	// Save updates
-	if err := h.db.Save(&expert).Error; err != nil {
-		http.Error(w, "Error updating expert", http.StatusInternalServerError)
-		return
-	}
+    // Handle certification file updates
+    if len(updateRequest.CertificationFiles) > 0 {
+        // Clear existing certification files
+        if err := h.db.Where("expert_id = ?", expert.ID).Delete(&models.CertificationFile{}).Error; err != nil {
+            http.Error(w, "Error clearing certification files", http.StatusInternalServerError)
+            return
+        }
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(expert)
+        // Add new certification files
+        for _, file := range updateRequest.CertificationFiles {
+            certificationFile := models.CertificationFile{
+                ExpertID: expert.ID,
+                FileName: file.FileName,
+                FilePath: file.FilePath,
+            }
+            if err := h.db.Create(&certificationFile).Error; err != nil {
+                http.Error(w, "Error adding certification files", http.StatusInternalServerError)
+                return
+            }
+        }
+    }
+
+    // Save expert updates
+    if err := h.db.Save(&expert).Error; err != nil {
+        http.Error(w, "Error updating expert", http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "message": "Expert updated successfully",
+        "expert":  expert,
+    })
 }
 
 // VerifyExpert handles expert verification by an admin

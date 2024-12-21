@@ -10,12 +10,12 @@ import (
 type User struct {
     gorm.Model
     FullName       string    `gorm:"column:full_name;size:255;not null" json:"full_name"`
-    Email          string    `gorm:"column:email;size:255;uniqueIndex;not null" json:"email"`
+    Email          string    `gorm:"column:email;size:255;not null" json:"email"`
     PasswordHash   string    `gorm:"column:password_hash;size:255;not null" json:"password_hash"`
     Role           string    `gorm:"column:role;size:50;not null" json:"role"`
-    Phone          string    `gorm:"column:phone;size:20;unique" json:"phone"`
+    Phone          string    `gorm:"column:phone;size:20;not null" json:"phone"`
     PhoneVerified  bool      `gorm:"column:phone_verified;default:false" json:"phone_verified"`
-    EmailVerified   bool      `gorm:"column:email_verified;default:false" json:"email_verified"`
+    EmailVerified   bool     `gorm:"column:email_verified;default:false" json:"email_verified"`
     OtpCode        string    `gorm:"column:otp_code;size:10" json:"otp_code"`
     Status         string    `gorm:"column:status;size:50;not null;default:inactive" json:"status"`
     Refresh        string    `gorm:"column:refresh_token;size:255" json:"refresh_token"`

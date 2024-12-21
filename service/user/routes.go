@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v4"
@@ -43,9 +44,9 @@ func (h *Handler) RegisterRoutes(router *mux.Router) {
 	router.HandleFunc("/users/{id}", h.DeleteUser).Methods("DELETE")
 	router.HandleFunc("/user/verify", h.verifyUser).Methods("POST")
 	router.HandleFunc("/refresh", h.handleRefreshToken).Methods("POST")
-	router.HandleFunc("/password/reset-request", h.handlePasswordResetRequest).Methods("POST")
+    router.HandleFunc("/reset-password/{userId}", h.handlePasswordResetRequest).Methods("POST")
+    router.HandleFunc("/reset-password/{userId}/confirm", h.handlePasswordReset).Methods("POST")
 	router.HandleFunc("/verify-reset-token", h.handleVerifyResetToken).Methods("POST")
-	router.HandleFunc("/password/reset", h.handlePasswordReset).Methods("POST")
 	router.HandleFunc("/experts", h.GetExperts).Methods("GET")
 	router.HandleFunc("/experts/{id}", h.GetExpert).Methods("GET")
 	router.HandleFunc("/experts/{id}", h.UpdateExpert).Methods("PUT")
@@ -153,6 +154,25 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    // Validate unique constraints before transaction
+    var existingUser models.User
+    if result := h.db.Where("email = ? OR phone = ?", registerRequest.Email, registerRequest.Phone).First(&existingUser); result.Error == nil {
+        var errorMessage string
+        if existingUser.Email == registerRequest.Email && existingUser.Phone == registerRequest.Phone {
+            errorMessage = "Email and phone number are already in use"
+        } else if existingUser.Email == registerRequest.Email {
+            errorMessage = "Email is already in use"
+        } else {
+            errorMessage = "Phone number is already in use"
+        }
+        
+        // Log the duplicate entry attempt
+        log.Printf("Registration attempt with duplicate %s", errorMessage)
+        
+        http.Error(w, errorMessage, http.StatusConflict)
+        return
+    }
+
     // Hash password
     passwordHash, err := bcrypt.GenerateFromPassword([]byte(registerRequest.Password), bcrypt.DefaultCost)
     if err != nil {
@@ -180,6 +200,14 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
     }
 
     if err := tx.Create(&user).Error; err != nil {
+        // Check for unique constraint violation
+        if strings.Contains(err.Error(), "UNIQUE constraint") || strings.Contains(err.Error(), "duplicate key") {
+            log.Printf("Unique constraint violation during user creation: %v", err)
+            tx.Rollback()
+            http.Error(w, "Email or phone number is already in use", http.StatusConflict)
+            return
+        }
+        
         tx.Rollback()
         http.Error(w, "Error registering user", http.StatusInternalServerError)
         return
@@ -586,20 +614,19 @@ type PasswordResetToken struct {
 }
 
 func (h *Handler) handlePasswordResetRequest(w http.ResponseWriter, r *http.Request) {
-    var resetRequest struct {
-        Email string `json:"email"`
-    }
-
-    if err := json.NewDecoder(r.Body).Decode(&resetRequest); err != nil {
-        http.Error(w, "Invalid request body", http.StatusBadRequest)
+    // Extract user ID from URL parameters
+    vars := mux.Vars(r)
+    userID, err := strconv.ParseUint(vars["userId"], 10, 32)
+    if err != nil {
+        http.Error(w, "Invalid user ID", http.StatusBadRequest)
         return
     }
 
-    // Find user by email
+    // Find user by ID
     var user models.User
-    result := h.db.Where("email = ?", resetRequest.Email).First(&user)
+    result := h.db.First(&user, userID)
     if result.Error != nil {
-        // Deliberately vague response to prevent email enumeration
+        // Still keeping response vague for security
         http.Error(w, "If an account exists, a reset link will be sent", http.StatusOK)
         return
     }
@@ -619,7 +646,7 @@ func (h *Handler) handlePasswordResetRequest(w http.ResponseWriter, r *http.Requ
 
     // Create new reset token
     passwordResetToken := models.PasswordResetToken{
-        UserID:    user.ID,
+        UserID:    uint(userID),
         Token:     resetToken,
         ExpiresAt: time.Now().Add(5 * time.Minute),
     }
@@ -637,21 +664,7 @@ func (h *Handler) handlePasswordResetRequest(w http.ResponseWriter, r *http.Requ
     }
 
     // Send the reset code via email
-    // subject := "Password Reset Request"
-    // body := fmt.Sprintf(`
-    //     Hi %s,
-
-    //     You requested a password reset. Use the code below to reset your password:
-
-    //     %s
-
-    //     If you did not request this, please ignore this email. The code is valid for 5 minutes.
-
-    //     Best regards,
-    //     Your Team
-    // `, user.FullName, resetToken)
-
-    if err := sendVerificationEmail(resetRequest.Email, resetToken); err != nil {
+    if err := sendVerificationEmail(user.Email, resetToken); err != nil {
         http.Error(w, "Error sending email", http.StatusInternalServerError)
         return
     }
@@ -664,63 +677,68 @@ func (h *Handler) handlePasswordResetRequest(w http.ResponseWriter, r *http.Requ
 }
 
 
-
 func (h *Handler) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
-	var resetRequest struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
-	}
+    // Extract user ID from URL parameters
+    vars := mux.Vars(r)
+    userID, err := strconv.ParseUint(vars["userId"], 10, 32)
+    if err != nil {
+        http.Error(w, "Invalid user ID", http.StatusBadRequest)
+        return
+    }
 
-	if err := json.NewDecoder(r.Body).Decode(&resetRequest); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
+    var resetRequest struct {
+        Password string `json:"password"`
+    }
 
-	// Validate password strength (basic example)
-	if len(resetRequest.Password) < 6 {
-		http.Error(w, "Password must be at least 6 characters long", http.StatusBadRequest)
-		return
-	}
+    if err := json.NewDecoder(r.Body).Decode(&resetRequest); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
 
-	// Begin a transaction
-	tx := h.db.Begin()
+    // Validate password strength
+    if len(resetRequest.Password) < 6 {
+        http.Error(w, "Password must be at least 6 characters long", http.StatusBadRequest)
+        return
+    }
 
-	// Find the user by email
-	var user models.User
-	if err := tx.Where("email = ?", resetRequest.Email).First(&user).Error; err != nil {
-		tx.Rollback()
-		http.Error(w, "User not found", http.StatusNotFound)
-		return
-	}
+    // Begin a transaction
+    tx := h.db.Begin()
 
-	// Hash the new password
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(resetRequest.Password), bcrypt.DefaultCost)
-	if err != nil {
-		tx.Rollback()
-		http.Error(w, "Error hashing password", http.StatusInternalServerError)
-		return
-	}
+    // Find the user by ID
+    var user models.User
+    if err := tx.First(&user, userID).Error; err != nil {
+        tx.Rollback()
+        http.Error(w, "User not found", http.StatusNotFound)
+        return
+    }
 
-	// Update the user's password
-	user.PasswordHash = string(passwordHash)
-	if err := tx.Save(&user).Error; err != nil {
-		tx.Rollback()
-		http.Error(w, "Error updating password", http.StatusInternalServerError)
-		return
-	}
+    // Hash the new password
+    passwordHash, err := bcrypt.GenerateFromPassword([]byte(resetRequest.Password), bcrypt.DefaultCost)
+    if err != nil {
+        tx.Rollback()
+        http.Error(w, "Error hashing password", http.StatusInternalServerError)
+        return
+    }
 
-	// Commit the transaction
-	if err := tx.Commit().Error; err != nil {
-		http.Error(w, "Error processing password reset", http.StatusInternalServerError)
-		return
-	}
+    // Update the user's password
+    user.PasswordHash = string(passwordHash)
+    if err := tx.Save(&user).Error; err != nil {
+        tx.Rollback()
+        http.Error(w, "Error updating password", http.StatusInternalServerError)
+        return
+    }
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"message": "Password reset successful",
-	})
+    // Commit the transaction
+    if err := tx.Commit().Error; err != nil {
+        http.Error(w, "Error processing password reset", http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{
+        "message": "Password reset successful",
+    })
 }
-
 
 
 

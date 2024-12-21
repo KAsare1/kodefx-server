@@ -4,7 +4,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/KAsare1/Kodefx-server/service"
+	// "github.com/KAsare1/Kodefx-server/service"
 	"github.com/KAsare1/Kodefx-server/service/appointment"
 	"github.com/KAsare1/Kodefx-server/service/availability"
 	"github.com/KAsare1/Kodefx-server/service/forum"
@@ -43,8 +43,8 @@ func (s *APIServer) Run() error {
 	forumHandler := forum.NewPostHandler(s.db)
     forumHandler.RegisterRoutes(subrouter)
 
-	wsHandler := service.NewWebSocketHandler(s.db)
-	wsHandler.RegisterRoutes(subrouter)
+	// wsHandler := service.NewWebSocketHandler(s.db)
+	// wsHandler.RegisterRoutes(subrouter)
 
 
 	log.Println("Server running at", s.address)

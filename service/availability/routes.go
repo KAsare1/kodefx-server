@@ -34,7 +34,7 @@ func (h *AvailabilityHandler) RegisterRoutes(router *mux.Router) {
 
 func (h *AvailabilityHandler) CreateAvailability(w http.ResponseWriter, r *http.Request) {
     vars := mux.Vars(r)
-    expertID, err := strconv.ParseUint(vars["expertId"], 10, 64)
+    expertID, err := strconv.Atoi(vars["expertId"])
     if err != nil {
         http.Error(w, "Invalid expert ID", http.StatusBadRequest)
         return
@@ -54,30 +54,42 @@ func (h *AvailabilityHandler) CreateAvailability(w http.ResponseWriter, r *http.
 
     // Check for overlapping slots
     var existingAvailability models.Availability
-    overlap := h.db.Where("expert_id = ? AND date = ? AND ((start_time <= ? AND end_time >= ?) OR (start_time <= ? AND end_time >= ?))",
+    overlap := h.db.Where("expert_id = ? AND date = ? AND ((start_time < ? AND end_time > ?) OR (start_time < ? AND end_time > ?))",
         expertID,
         availability.Date,
         availability.EndTime,
         availability.StartTime,
-        availability.EndTime,
         availability.StartTime,
-		availability.Price,
+        availability.EndTime,
     ).First(&existingAvailability)
+
+    if overlap.Error != nil && overlap.Error != gorm.ErrRecordNotFound {
+        http.Error(w, "Database error", http.StatusInternalServerError)
+        return
+    }
 
     if overlap.Error == nil {
         http.Error(w, "Time slot overlaps with existing availability", http.StatusConflict)
         return
     }
 
+    // Assign the expert ID
     availability.ExpertID = uint(expertID)
+
+    // Create availability
     if err := h.db.Create(&availability).Error; err != nil {
         http.Error(w, "Error creating availability", http.StatusInternalServerError)
         return
     }
 
+    // Send success response
     w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusCreated)
     json.NewEncoder(w).Encode(availability)
 }
+
+
+
 
 func (h *AvailabilityHandler) GetAvailabilities(w http.ResponseWriter, r *http.Request) {
     vars := mux.Vars(r)

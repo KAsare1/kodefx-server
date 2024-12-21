@@ -22,7 +22,7 @@ func NewPostHandler(db *gorm.DB) *PostHandler {
 
 func (h *PostHandler) RegisterRoutes(router *mux.Router) {
     // Post routes
-    router.HandleFunc("/posts", h.CreatePost).Methods("POST")
+    router.HandleFunc("/posts", utils.AuthMiddleware(h.CreatePost)).Methods("POST")
     router.HandleFunc("/posts", h.GetPosts).Methods("GET")
     router.HandleFunc("/posts/{id}", h.GetPost).Methods("GET")
     // router.HandleFunc("/posts/{id}", h.UpdatePost).Methods("PUT")
@@ -33,7 +33,7 @@ func (h *PostHandler) RegisterRoutes(router *mux.Router) {
     router.HandleFunc("/posts/{id}/unlike", h.UnlikePost).Methods("POST")
     
     // Comment routes
-    router.HandleFunc("/posts/{id}/comments", h.AddComment).Methods("POST")
+    router.HandleFunc("/posts/{id}/comments", utils.AuthMiddleware(h.AddComment)).Methods("POST")
     router.HandleFunc("/posts/{id}/comments", h.GetComments).Methods("GET")
     router.HandleFunc("/posts/{id}/comments/{commentId}", h.UpdateComment).Methods("PUT")
     router.HandleFunc("/posts/{id}/comments/{commentId}", h.DeleteComment).Methods("DELETE")
@@ -45,7 +45,7 @@ func (h *PostHandler) RegisterRoutes(router *mux.Router) {
 
 // CreatePost creates a new post
 func (h *PostHandler) CreatePost(w http.ResponseWriter, r *http.Request) {
-    userID, err := utils.GetUserIDFromContext(r)
+    userID, err := utils.GetUserIDFromContext(r.Context())
     if err != nil {
         http.Error(w, "Unauthorized", http.StatusUnauthorized)
         return
@@ -215,8 +215,13 @@ func (h *PostHandler) AddComment(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // TODO: Get user ID from JWT token
-    comment.UserID = uint(1) // Replace with actual user ID from token
+
+
+    comment.UserID, err = utils.GetUserIDFromContext(r.Context())
+    if err != nil {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
     comment.PostID = uint(postID)
 
     if err := h.db.Create(&comment).Error; err != nil {
@@ -243,8 +248,11 @@ func (h *PostHandler) SharePost(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // TODO: Get user ID from JWT token
-    share.UserID = uint(1) // Replace with actual user ID from token
+    share.UserID, err = utils.GetUserIDFromContext(r.Context()) 
+    if err != nil {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
     share.PostID = uint(postID)
 
     // Start transaction

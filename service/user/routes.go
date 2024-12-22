@@ -4,12 +4,15 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
+	"mime/multipart"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -34,10 +37,11 @@ func NewHandler(db *gorm.DB) *Handler {
 
 
 
+
 // RegisterRoutes sets up all user-related routes
 func (h *Handler) RegisterRoutes(router *mux.Router) {
 	router.HandleFunc("/login", h.handleLogin).Methods("POST")
-	router.HandleFunc("/register", h.handleRegister).Methods("POST")
+	router.HandleFunc("/register", h.HandleRegister).Methods("POST")
 	router.HandleFunc("/users", h.GetUsers).Methods("GET")
 	router.HandleFunc("/users/{id}", h.GetUser).Methods("GET")
 	router.HandleFunc("/users/{id}", h.UpdateUser).Methods("PUT")
@@ -53,9 +57,103 @@ func (h *Handler) RegisterRoutes(router *mux.Router) {
 	router.HandleFunc("/experts/verify/{id}", h.VerifyExpert).Methods("POST")
 	router.HandleFunc("/experts/search", h.SearchExperts).Methods("GET")
 	router.HandleFunc("/experts/expertise/{expertise}", h.GetExpertsByExpertise).Methods("GET")
+    router.HandleFunc("/images/{filename}", h.ServeImage).Methods("GET")
+    router.HandleFunc("/certifications/{filename}", h.ServeCertification).Methods("GET")
+
+    fileServer := http.FileServer(http.Dir("uploads/images"))
+    router.PathPrefix("/images/").Handler(http.StripPrefix("/images/", fileServer))
+
 }
 
 
+func (h *Handler) ServeImage(w http.ResponseWriter, r *http.Request) {
+    vars := mux.Vars(r)
+    filename := vars["filename"]
+
+    // Basic security check for directory traversal
+    if containsDotDot(filename) {
+        http.Error(w, "Invalid path", http.StatusBadRequest)
+        return
+    }
+
+    // Construct the full path
+    imagePath := filepath.Join("uploads/images", filepath.Clean(filename))
+
+    // Check if file exists
+    if _, err := os.Stat(imagePath); os.IsNotExist(err) {
+        http.Error(w, "Image not found", http.StatusNotFound)
+        return
+    }
+
+    // Set headers
+    w.Header().Set("Cache-Control", "public, max-age=3600")
+    w.Header().Set("Content-Type", getContentType(imagePath))
+
+    // Serve the file
+    http.ServeFile(w, r, imagePath)
+}
+
+func containsDotDot(v string) bool {
+    if !filepath.IsAbs(v) {
+        v = filepath.Clean(filepath.Join("/", v))
+    }
+    return filepath.Clean(v) != v
+}
+
+func (h *Handler) ServeCertification(w http.ResponseWriter, r *http.Request) {
+    vars := mux.Vars(r)
+    filename := vars["filename"]
+
+    if containsDotDot(filename) {
+        http.Error(w, "Invalid path", http.StatusBadRequest)
+        return
+    }
+
+    certPath := filepath.Join("uploads/certifications", filepath.Clean(filename))
+    serveFile(w, r, certPath, false)
+}
+
+
+func serveFile(w http.ResponseWriter, r *http.Request, filepath string, isImage bool) {
+    // Check if file exists
+    if _, err := os.Stat(filepath); os.IsNotExist(err) {
+        http.Error(w, "File not found", http.StatusNotFound)
+        return
+    }
+
+    // Set appropriate headers based on file type
+    if isImage {
+        w.Header().Set("Cache-Control", "public, max-age=3600")
+        w.Header().Set("Content-Type", getContentType(filepath))
+    } else {
+        // For certifications (typically PDFs)
+        w.Header().Set("Content-Type", "application/pdf")
+        // Optional: force download instead of displaying in browser
+        w.Header().Set("Content-Disposition", "attachment")
+    }
+
+    http.ServeFile(w, r, filepath)
+}
+
+
+
+
+// Helper function to determine content type
+func getContentType(filename string) string {
+    ext := filepath.Ext(filename)
+    switch ext {
+    case ".jpg", ".jpeg":
+        return "image/jpeg"
+    case ".png":
+        return "image/png"
+    case ".gif":
+        return "image/gif"
+    case ".webp":
+        return "image/webp"
+    default:
+        return "application/octet-stream"
+    }
+}
 
 
 func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -134,29 +232,94 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 
-func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
-    var registerRequest struct {
-        FullName          string `json:"full_name"`
-        Email             string `json:"email"`
-        Password          string `json:"password"`
-        Phone             string `json:"phone"`
-        Role              string `json:"role"`
-        Expertise         string `json:"expertise,omitempty"`
-        Bio               string `json:"bio,omitempty"`
-        CertificationFiles []struct {
-            FileName string `json:"file_name"`
-            FilePath string `json:"file_path"`
-        } `json:"certification_files,omitempty"`
+
+func (h *Handler) handleCertificationFile(tx *gorm.DB, file *multipart.FileHeader, expertID uint) error {
+    // Create uploads directory if it doesn't exist
+    uploadsDir := "uploads/certifications"
+    if err := os.MkdirAll(uploadsDir, 0755); err != nil {
+        return fmt.Errorf("failed to create uploads directory: %w", err)
     }
 
-    if err := json.NewDecoder(r.Body).Decode(&registerRequest); err != nil {
-        http.Error(w, "Invalid request body", http.StatusBadRequest)
+    // Generate a unique filename to prevent collisions
+    fileExt := filepath.Ext(file.Filename)
+    uniqueFilename := fmt.Sprintf("%d%s", time.Now().UnixNano(), fileExt)
+    filePath := filepath.Join(uploadsDir, uniqueFilename)
+
+    // Open source file
+    src, err := file.Open()
+    if err != nil {
+        return fmt.Errorf("failed to open uploaded file: %w", err)
+    }
+    defer src.Close()
+
+    // Create destination file
+    dst, err := os.Create(filePath)
+    if err != nil {
+        return fmt.Errorf("failed to create destination file: %w", err)
+    }
+    defer dst.Close()
+
+    // Copy file contents
+    if _, err = io.Copy(dst, src); err != nil {
+        return fmt.Errorf("failed to copy file contents: %w", err)
+    }
+
+    // Save file information to database
+    certificationFile := models.CertificationFile{
+        ExpertID: expertID,
+        FileName: file.Filename,
+        FilePath: filePath,
+    }
+
+    if err := tx.Create(&certificationFile).Error; err != nil {
+        // Clean up the file if database insertion fails
+        os.Remove(filePath)
+        return fmt.Errorf("failed to save file information to database: %w", err)
+    }
+
+    return nil
+}
+
+func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
+    // Parse form data
+    if err := r.ParseMultipartForm(10 << 20); err != nil { // Limit to 10MB
+        http.Error(w, "Error parsing form data", http.StatusBadRequest)
         return
     }
 
-    // Validate unique constraints before transaction
+    // Extract form values
+    registerRequest := struct {
+        FullName  string
+        Email     string
+        Password  string
+        Phone     string
+        Role      string
+        Expertise string
+        Bio       string
+    }{
+        FullName:  r.FormValue("full_name"),
+        Email:     r.FormValue("email"),
+        Password:  r.FormValue("password"),
+        Phone:     r.FormValue("phone"),
+        Role:      r.FormValue("role"),
+        Expertise: r.FormValue("expertise"),
+        Bio:       r.FormValue("bio"),
+    }
+
+    // Validate required fields
+    if registerRequest.FullName == "" || registerRequest.Email == "" || registerRequest.Password == "" || registerRequest.Phone == "" || registerRequest.Role == "" {
+        http.Error(w, "Missing required fields", http.StatusBadRequest)
+        return
+    }
+
+    // Validate unique constraints
     var existingUser models.User
-    if result := h.db.Where("email = ? OR phone = ?", registerRequest.Email, registerRequest.Phone).First(&existingUser); result.Error == nil {
+    if result := h.db.Where("email = ? OR phone = ?", registerRequest.Email, registerRequest.Phone).First(&existingUser); !errors.Is(result.Error, gorm.ErrRecordNotFound) {
+        if result.Error != nil {
+            http.Error(w, "Database error", http.StatusInternalServerError)
+            return
+        }
+        
         var errorMessage string
         if existingUser.Email == registerRequest.Email && existingUser.Phone == registerRequest.Phone {
             errorMessage = "Email and phone number are already in use"
@@ -165,10 +328,7 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
         } else {
             errorMessage = "Phone number is already in use"
         }
-        
-        // Log the duplicate entry attempt
         log.Printf("Registration attempt with duplicate %s", errorMessage)
-        
         http.Error(w, errorMessage, http.StatusConflict)
         return
     }
@@ -180,16 +340,16 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Generate a 6-digit verification code
+    // Generate verification code
     verificationCode := fmt.Sprintf("%06d", rand.Intn(1000000))
-    verificationExpiry := time.Now().Add(15 * time.Minute) // Code expires in 15 minutes
+    verificationExpiry := time.Now().Add(15 * time.Minute)
 
-    // Begin a transaction
+    // Begin transaction
     tx := h.db.Begin()
 
     // Create user
     user := models.User{
-        FullName:            registerRequest.FullName,
+        FullName:             registerRequest.FullName,
         Email:               registerRequest.Email,
         PasswordHash:        string(passwordHash),
         Phone:               registerRequest.Phone,
@@ -200,21 +360,20 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
     }
 
     if err := tx.Create(&user).Error; err != nil {
-        // Check for unique constraint violation
         if strings.Contains(err.Error(), "UNIQUE constraint") || strings.Contains(err.Error(), "duplicate key") {
             log.Printf("Unique constraint violation during user creation: %v", err)
             tx.Rollback()
             http.Error(w, "Email or phone number is already in use", http.StatusConflict)
             return
         }
-        
         tx.Rollback()
         http.Error(w, "Error registering user", http.StatusInternalServerError)
         return
     }
 
-    // If the role is "expert", create an expert profile
+    var expertID uint
     if registerRequest.Role == "expert" {
+        // Create expert profile
         expert := models.Expert{
             UserID:    user.ID,
             Expertise: registerRequest.Expertise,
@@ -227,23 +386,20 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
             return
         }
 
-        // Add certification files
-        for _, file := range registerRequest.CertificationFiles {
-            certificationFile := models.CertificationFile{
-                ExpertID: expert.ID,
-                FileName: file.FileName,
-                FilePath: file.FilePath,
-            }
+        expertID = expert.ID
 
-            if err := tx.Create(&certificationFile).Error; err != nil {
+        // Handle certification files
+        files := r.MultipartForm.File["certification_files"]
+        for _, fileHeader := range files {
+            if err := h.handleCertificationFile(tx, fileHeader, expert.ID); err != nil {
                 tx.Rollback()
-                http.Error(w, "Error saving certification files", http.StatusInternalServerError)
+                http.Error(w, "Error processing certification file", http.StatusInternalServerError)
                 return
             }
         }
     }
 
-    // Commit the transaction
+    // Commit transaction
     if err := tx.Commit().Error; err != nil {
         http.Error(w, "Error committing transaction", http.StatusInternalServerError)
         return
@@ -258,10 +414,14 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 
     // Respond with success message
     w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(map[string]interface{}{
+    response := map[string]interface{}{
         "message": "User registered successfully. Please check your email for verification code.",
         "user_id": user.ID,
-    })
+    }
+    if expertID != 0 {
+        response["expert_id"] = expertID
+    }
+    json.NewEncoder(w).Encode(response)
 }
 
 // sendVerificationEmail sends a verification email with the 6-digit code
@@ -361,7 +521,7 @@ func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var user models.User
-	result := h.db.Preload("Expert").First(&user, userID)
+	result := h.db.Preload("Expert").First(&user, userID).Preload("ProfilePicturePath")
 	if result.Error != nil {
 		http.Error(w, "User not found", http.StatusNotFound)
 		return
@@ -402,20 +562,23 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	fullName := r.FormValue("full_name")
 	phone := r.FormValue("phone")
 
-	// Extract the file from the form
-	file, handler, err := r.FormFile("profile_picture")
+	// Handle file upload
 	var filePath string
-	if err == nil { // File exists
+	file, handler, err := r.FormFile("profile_picture_path")
+	if err == nil { // If file exists
 		defer file.Close()
 
-		// Validate and save the file
+		// Create upload directory if it doesn't exist
 		uploadPath := "uploads/images"
 		if err := createDirectoryIfNotExist(uploadPath); err != nil {
 			http.Error(w, "Error creating upload directory", http.StatusInternalServerError)
 			return
 		}
 
-		filePath = fmt.Sprintf("%s/%s", uploadPath, handler.Filename)
+		// Generate unique file name to avoid conflicts
+		filePath = fmt.Sprintf("%s/%d_%s", uploadPath, time.Now().Unix(), handler.Filename)
+
+		// Save the file
 		dst, err := os.Create(filePath)
 		if err != nil {
 			http.Error(w, "Error saving file", http.StatusInternalServerError)
@@ -427,12 +590,14 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Error copying file", http.StatusInternalServerError)
 			return
 		}
+	} else if err != http.ErrMissingFile { // Handle other file-related errors
+		http.Error(w, "Error processing file upload", http.StatusInternalServerError)
+		return
 	}
 
-	// Find and update user
+	// Find user by ID
 	var user models.User
-	result := h.db.First(&user, userID)
-	if result.Error != nil {
+	if err := h.db.First(&user, userID).Error; err != nil {
 		http.Error(w, "User not found", http.StatusNotFound)
 		return
 	}
@@ -444,16 +609,18 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	if phone != "" {
 		user.Phone = phone
 	}
-	if filePath != "" {
-		user.ProfilePicturePath = filePath // Assuming a `ProfilePicturePath` field in `User` model
-	}
+    if filePath != "" {
+        user.ProfilePicturePath = filePath
+        fmt.Println("File path:", filePath) // Debugging line
+    }
 
-	// Save updates
+	// Save updated user data
 	if err := h.db.Save(&user).Error; err != nil {
 		http.Error(w, "Error updating user", http.StatusInternalServerError)
 		return
 	}
 
+	// Return updated user details
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(user)
 }
@@ -787,64 +954,68 @@ func (h *Handler) handleVerifyResetToken(w http.ResponseWriter, r *http.Request)
 
 
 func (h *Handler) GetExperts(w http.ResponseWriter, r *http.Request) {
-	// Parse query parameters
-	verified := r.URL.Query().Get("verified")
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 {
-		page = 1
-	}
-	pageSize := 10
+    // Parse query parameters
+    verified := r.URL.Query().Get("verified")
+    page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+    if page < 1 {
+        page = 1
+    }
+    pageSize := 10
 
-	// Base query
-	query := h.db.Model(&models.Expert{}).Preload("User")
+    // Base query with both User and CertificationFiles preloaded
+    query := h.db.Model(&models.Expert{}).
+        Preload("User").
+        Preload("CertificationFiles")
 
-	// Filter by verification status if specified
-	if verified != "" {
-		isVerified, _ := strconv.ParseBool(verified)
-		query = query.Where("verified = ?", isVerified)
-	}
+    // Filter by verification status if specified
+    if verified != "" {
+        isVerified, _ := strconv.ParseBool(verified)
+        query = query.Where("verified = ?", isVerified)
+    }
 
-	// Pagination
-	var total int64
-	query.Count(&total)
-	
-	var experts []models.Expert
-	result := query.Offset((page - 1) * pageSize).Limit(pageSize).Find(&experts)
-	
-	if result.Error != nil {
-		http.Error(w, "Error retrieving experts", http.StatusInternalServerError)
-		return
-	}
+    // Pagination
+    var total int64
+    query.Count(&total)
+    
+    var experts []models.Expert
+    result := query.Offset((page - 1) * pageSize).Limit(pageSize).Find(&experts)
+    
+    if result.Error != nil {
+        http.Error(w, "Error retrieving experts", http.StatusInternalServerError)
+        return
+    }
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"experts":    experts,
-		"total":      total,
-		"page":       page,
-		"page_size":  pageSize,
-		"total_pages": (total + int64(pageSize) - 1) / int64(pageSize),
-	})
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "experts":     experts,
+        "total":       total,
+        "page":        page,
+        "page_size":   pageSize,
+        "total_pages": (total + int64(pageSize) - 1) / int64(pageSize),
+    })
 }
 
 // GetExpert retrieves a specific expert by ID with full details
 func (h *Handler) GetExpert(w http.ResponseWriter, r *http.Request) {
-	// Parse expert ID from URL
-	vars := mux.Vars(r)
-	expertID, err := strconv.ParseUint(vars["id"], 10, 64)
-	if err != nil {
-		http.Error(w, "Invalid expert ID", http.StatusBadRequest)
-		return
-	}
+    // Parse expert ID from URL
+    vars := mux.Vars(r)
+    expertID, err := strconv.ParseUint(vars["id"], 10, 64)
+    if err != nil {
+        http.Error(w, "Invalid expert ID", http.StatusBadRequest)
+        return
+    }
 
-	var expert models.Expert
-	result := h.db.Preload("User").First(&expert, expertID)
-	if result.Error != nil {
-		http.Error(w, "Expert not found", http.StatusNotFound)
-		return
-	}
+    var expert models.Expert
+    result := h.db.Preload("User").
+        Preload("CertificationFiles").
+        First(&expert, expertID)
+    if result.Error != nil {
+        http.Error(w, "Expert not found", http.StatusNotFound)
+        return
+    }
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(expert)
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(expert)
 }
 
 // UpdateExpert allows updating expert profile information

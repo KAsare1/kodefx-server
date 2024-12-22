@@ -131,7 +131,7 @@ func (h *PostHandler) GetPosts(w http.ResponseWriter, r *http.Request) {
     var posts []models.Post
     var total int64
 
-    query := h.db.Model(&models.Post{}).Preload("User").Preload("Likes").Preload("Comments")
+    query := h.db.Model(&models.Post{}).Preload("User").Preload("Likes").Preload("Comments").Preload("Images")
     query.Count(&total)
 
     if err := query.Offset((page - 1) * pageSize).Limit(pageSize).Find(&posts).Error; err != nil {
@@ -290,7 +290,7 @@ func (h *PostHandler) GetPost(w http.ResponseWriter, r *http.Request) {
     }
 
     var post models.Post
-    if err := h.db.Preload("User").Preload("Likes").Preload("Comments.User").First(&post, postID).Error; err != nil {
+    if err := h.db.Preload("User").Preload("Likes").Preload("Images").Preload("Comments.User").First(&post, postID).Error; err != nil {
         http.Error(w, "Post not found", http.StatusNotFound)
         return
     }

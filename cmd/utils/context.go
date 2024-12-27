@@ -15,7 +15,7 @@ type contextKey string
 
 // Define context keys
 const UserIDKey contextKey = "userID"
-var jwtSecretKey = []byte(os.Getenv("JWT_SECRET"))
+var jwtSecretKey = []byte(os.Getenv("SECRET_KEY"))
 
 // Middleware to verify JWT and set userID in context
 func AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {

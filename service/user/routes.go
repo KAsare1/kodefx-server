@@ -281,31 +281,21 @@ func (h *Handler) handleCertificationFile(tx *gorm.DB, file *multipart.FileHeade
 }
 
 func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
-    // Parse form data
-    if err := r.ParseMultipartForm(10 << 20); err != nil { // Limit to 10MB
-        http.Error(w, "Error parsing form data", http.StatusBadRequest)
+    // Parse json data
+    var registerRequest struct {
+        FullName           string   `json:"full_name"`
+        Email              string   `json:"email"`
+        Password           string   `json:"password"`
+        Phone              string   `json:"phone"`
+        Role               string   `json:"role"`
+        Expertise          string   `json:"expertise"`
+        Bio                string   `json:"bio"`
+        CertificationFiles []string `json:"certification_files"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&registerRequest); err != nil {
+        http.Error(w, "Invalid JSON input", http.StatusBadRequest)
         return
     }
-
-    // Extract form values
-    registerRequest := struct {
-        FullName  string
-        Email     string
-        Password  string
-        Phone     string
-        Role      string
-        Expertise string
-        Bio       string
-    }{
-        FullName:  r.FormValue("full_name"),
-        Email:     r.FormValue("email"),
-        Password:  r.FormValue("password"),
-        Phone:     r.FormValue("phone"),
-        Role:      r.FormValue("role"),
-        Expertise: r.FormValue("expertise"),
-        Bio:       r.FormValue("bio"),
-    }
-
     // Validate required fields
     if registerRequest.FullName == "" || registerRequest.Email == "" || registerRequest.Password == "" || registerRequest.Phone == "" || registerRequest.Role == "" {
         http.Error(w, "Missing required fields", http.StatusBadRequest)
@@ -389,11 +379,14 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
         expertID = expert.ID
 
         // Handle certification files
-        files := r.MultipartForm.File["certification_files"]
-        for _, fileHeader := range files {
-            if err := h.handleCertificationFile(tx, fileHeader, expert.ID); err != nil {
+        for _, fileURL := range registerRequest.CertificationFiles {
+            certification := models.CertificationFile{
+                ExpertID: expertID,
+                FilePath:  fileURL,
+            }
+            if err := tx.Create(&certification).Error; err != nil {
                 tx.Rollback()
-                http.Error(w, "Error processing certification file", http.StatusInternalServerError)
+                http.Error(w, "Error saving certification URL", http.StatusInternalServerError)
                 return
             }
         }
@@ -423,6 +416,9 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
     }
     json.NewEncoder(w).Encode(response)
 }
+
+
+
 
 // sendVerificationEmail sends a verification email with the 6-digit code
 func sendVerificationEmail(email, code string) error {
@@ -532,14 +528,14 @@ func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
 }
 
 
-func createDirectoryIfNotExist(path string) error {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := os.MkdirAll(path, 0755); err != nil {
-			return fmt.Errorf("could not create directory %s: %w", path, err)
-		}
-	}
-	return nil
-}
+// func createDirectoryIfNotExist(path string) error {
+// 	if _, err := os.Stat(path); os.IsNotExist(err) {
+// 		if err := os.MkdirAll(path, 0755); err != nil {
+// 			return fmt.Errorf("could not create directory %s: %w", path, err)
+// 		}
+// 	}
+// 	return nil
+// }
 
 
 // UpdateUser updates user information
@@ -553,45 +549,13 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse multipart form data
-	if err := r.ParseMultipartForm(10 << 20); err != nil { // Limit to 10MB
-		http.Error(w, "Error parsing form data", http.StatusBadRequest)
-		return
+	var updateData struct {
+		FullName          string `json:"full_name"`
+		Phone             string `json:"phone"`
+		ProfilePictureURL string `json:"profile_picture_path"`
 	}
-
-	// Extract fields from form
-	fullName := r.FormValue("full_name")
-	phone := r.FormValue("phone")
-
-	// Handle file upload
-	var filePath string
-	file, handler, err := r.FormFile("profile_picture_path")
-	if err == nil { // If file exists
-		defer file.Close()
-
-		// Create upload directory if it doesn't exist
-		uploadPath := "uploads/images"
-		if err := createDirectoryIfNotExist(uploadPath); err != nil {
-			http.Error(w, "Error creating upload directory", http.StatusInternalServerError)
-			return
-		}
-
-		// Generate unique file name to avoid conflicts
-		filePath = fmt.Sprintf("%s/%d_%s", uploadPath, time.Now().Unix(), handler.Filename)
-
-		// Save the file
-		dst, err := os.Create(filePath)
-		if err != nil {
-			http.Error(w, "Error saving file", http.StatusInternalServerError)
-			return
-		}
-		defer dst.Close()
-
-		if _, err := io.Copy(dst, file); err != nil {
-			http.Error(w, "Error copying file", http.StatusInternalServerError)
-			return
-		}
-	} else if err != http.ErrMissingFile { // Handle other file-related errors
-		http.Error(w, "Error processing file upload", http.StatusInternalServerError)
+	if err := json.NewDecoder(r.Body).Decode(&updateData); err != nil {
+		http.Error(w, "Invalid JSON input", http.StatusBadRequest)
 		return
 	}
 
@@ -603,16 +567,15 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update fields
-	if fullName != "" {
-		user.FullName = fullName
+	if updateData.FullName != "" {
+		user.FullName = updateData.FullName
 	}
-	if phone != "" {
-		user.Phone = phone
+	if updateData.Phone != "" {
+		user.Phone = updateData.Phone
 	}
-    if filePath != "" {
-        user.ProfilePicturePath = filePath
-        fmt.Println("File path:", filePath) // Debugging line
-    }
+	if updateData.ProfilePictureURL != "" {
+		user.ProfilePicturePath = updateData.ProfilePictureURL
+	}
 
 	// Save updated user data
 	if err := h.db.Save(&user).Error; err != nil {

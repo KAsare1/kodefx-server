@@ -29,8 +29,8 @@ func (h *PostHandler) RegisterRoutes(router *mux.Router) {
     router.HandleFunc("/posts/{id}", h.DeletePost).Methods("DELETE")
     
     // Like routes
-    router.HandleFunc("/posts/{id}/like", h.LikePost).Methods("POST")
-    router.HandleFunc("/posts/{id}/unlike", h.UnlikePost).Methods("POST")
+    router.HandleFunc("/posts/{id}/like", utils.AuthMiddleware(h.LikePost)).Methods("POST")
+    router.HandleFunc("/posts/{id}/unlike", utils.AuthMiddleware(h.UnlikePost)).Methods("POST")
     
     // Comment routes
     router.HandleFunc("/posts/{id}/comments", utils.AuthMiddleware(h.AddComment)).Methods("POST")
@@ -121,12 +121,19 @@ func (h *PostHandler) GetPosts(w http.ResponseWriter, r *http.Request) {
     if page < 1 {
         page = 1
     }
-    pageSize := 10
+    // Get page size from query params with validation
+    pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+    if pageSize < 1 {
+        pageSize = 15 // default size
+    }
+    if pageSize > 100 { // set a reasonable maximum
+        pageSize = 100
+    }
 
     var posts []models.Post
     var total int64
 
-    query := h.db.Model(&models.Post{}).Preload("User").Preload("Likes").Preload("Comments").Preload("Images")
+    query := h.db.Model(&models.Post{}).Preload("User").Preload("Likes").Preload("Comments").Preload("Images").Order("created_at DESC")
     query.Count(&total)
 
     if err := query.Offset((page - 1) * pageSize).Limit(pageSize).Find(&posts).Error; err != nil {
@@ -153,8 +160,11 @@ func (h *PostHandler) LikePost(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // TODO: Get user ID from JWT token
-    userID := uint(1) // Replace with actual user ID from token
+    userID, err := utils.GetUserIDFromContext(r.Context())
+    if err != nil {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
 
     // Start transaction
     tx := h.db.Begin()
@@ -406,8 +416,11 @@ func (h *PostHandler) UnlikePost(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // TODO: Get user ID from JWT token
-    userID := uint(1) // Replace with actual user ID from token
+    userID, err := utils.GetUserIDFromContext(r.Context())
+    if err != nil {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
 
     tx := h.db.Begin()
 

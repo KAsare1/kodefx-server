@@ -703,7 +703,7 @@ var jwtSecretKey = []byte(os.Getenv("SECRET_KEY"))
 func generateJWT(userID uint, expirationMinutes int) (string, error) {
     claims := &jwt.RegisteredClaims{
         Subject:   fmt.Sprint(userID),
-        ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Minute * time.Duration(expirationMinutes))),
+        ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour * time.Duration(expirationMinutes))),
     }
     token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
     return token.SignedString(jwtSecretKey)

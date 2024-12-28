@@ -6,10 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"math/rand"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -233,52 +231,52 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 
 
-func (h *Handler) handleCertificationFile(tx *gorm.DB, file *multipart.FileHeader, expertID uint) error {
-    // Create uploads directory if it doesn't exist
-    uploadsDir := "uploads/certifications"
-    if err := os.MkdirAll(uploadsDir, 0755); err != nil {
-        return fmt.Errorf("failed to create uploads directory: %w", err)
-    }
+// func (h *Handler) handleCertificationFile(tx *gorm.DB, file *multipart.FileHeader, expertID uint) error {
+//     // Create uploads directory if it doesn't exist
+//     uploadsDir := "uploads/certifications"
+//     if err := os.MkdirAll(uploadsDir, 0755); err != nil {
+//         return fmt.Errorf("failed to create uploads directory: %w", err)
+//     }
 
-    // Generate a unique filename to prevent collisions
-    fileExt := filepath.Ext(file.Filename)
-    uniqueFilename := fmt.Sprintf("%d%s", time.Now().UnixNano(), fileExt)
-    filePath := filepath.Join(uploadsDir, uniqueFilename)
+//     // Generate a unique filename to prevent collisions
+//     fileExt := filepath.Ext(file.Filename)
+//     uniqueFilename := fmt.Sprintf("%d%s", time.Now().UnixNano(), fileExt)
+//     filePath := filepath.Join(uploadsDir, uniqueFilename)
 
-    // Open source file
-    src, err := file.Open()
-    if err != nil {
-        return fmt.Errorf("failed to open uploaded file: %w", err)
-    }
-    defer src.Close()
+//     // Open source file
+//     src, err := file.Open()
+//     if err != nil {
+//         return fmt.Errorf("failed to open uploaded file: %w", err)
+//     }
+//     defer src.Close()
 
-    // Create destination file
-    dst, err := os.Create(filePath)
-    if err != nil {
-        return fmt.Errorf("failed to create destination file: %w", err)
-    }
-    defer dst.Close()
+//     // Create destination file
+//     dst, err := os.Create(filePath)
+//     if err != nil {
+//         return fmt.Errorf("failed to create destination file: %w", err)
+//     }
+//     defer dst.Close()
 
-    // Copy file contents
-    if _, err = io.Copy(dst, src); err != nil {
-        return fmt.Errorf("failed to copy file contents: %w", err)
-    }
+//     // Copy file contents
+//     if _, err = io.Copy(dst, src); err != nil {
+//         return fmt.Errorf("failed to copy file contents: %w", err)
+//     }
 
-    // Save file information to database
-    certificationFile := models.CertificationFile{
-        ExpertID: expertID,
-        FileName: file.Filename,
-        FilePath: filePath,
-    }
+//     // Save file information to database
+//     certificationFile := models.CertificationFile{
+//         ExpertID: expertID,
+//         FileName: file.Filename,
+//         FilePath: filePath,
+//     }
 
-    if err := tx.Create(&certificationFile).Error; err != nil {
-        // Clean up the file if database insertion fails
-        os.Remove(filePath)
-        return fmt.Errorf("failed to save file information to database: %w", err)
-    }
+//     if err := tx.Create(&certificationFile).Error; err != nil {
+//         // Clean up the file if database insertion fails
+//         os.Remove(filePath)
+//         return fmt.Errorf("failed to save file information to database: %w", err)
+//     }
 
-    return nil
-}
+//     return nil
+// }
 
 func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
     // Parse json data

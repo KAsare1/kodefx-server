@@ -899,38 +899,78 @@ func (h *Handler) handleVerifyResetToken(w http.ResponseWriter, r *http.Request)
 func (h *Handler) GetExperts(w http.ResponseWriter, r *http.Request) {
     // Parse query parameters
     verified := r.URL.Query().Get("verified")
-    page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-    if page < 1 {
+    page, err := strconv.Atoi(r.URL.Query().Get("page"))
+    if err != nil || page < 1 {
         page = 1
     }
-    pageSize := 10
+    pageSize := 20
 
     // Base query with both User and CertificationFiles preloaded
     query := h.db.Model(&models.Expert{}).
-        Preload("User").
-        Preload("CertificationFiles")
+        Preload("User").        // Preload User fields
+        Preload("CertificationFiles") // Preload CertificationFiles
 
     // Filter by verification status if specified
     if verified != "" {
-        isVerified, _ := strconv.ParseBool(verified)
+        isVerified, parseErr := strconv.ParseBool(verified)
+        if parseErr != nil {
+            http.Error(w, "Invalid value for 'verified'", http.StatusBadRequest)
+            return
+        }
         query = query.Where("verified = ?", isVerified)
     }
 
     // Pagination
     var total int64
     query.Count(&total)
-    
+
     var experts []models.Expert
     result := query.Offset((page - 1) * pageSize).Limit(pageSize).Find(&experts)
-    
+
     if result.Error != nil {
         http.Error(w, "Error retrieving experts", http.StatusInternalServerError)
         return
     }
 
+    // Check if there are no experts
+    if len(experts) == 0 {
+        http.Error(w, "No experts found", http.StatusNotFound)
+        return
+    }
+
+    // Return the response
     w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusOK)
+
+    // Construct a response that includes both the expert and user data
+    response := []map[string]interface{}{}
+    for _, expert := range experts {
+        user := expert.User  // Access the preloaded User data
+        expertData := map[string]interface{}{
+            "ID":               expert.ID,
+            "CreatedAt":        expert.CreatedAt,
+            "UpdatedAt":        expert.UpdatedAt,
+            "UserID":           expert.UserID,
+            "Expertise":        expert.Expertise,
+            "Bio":              expert.Bio,
+            "Verified":         expert.Verified,
+            "CertificationFiles": expert.CertificationFiles,
+            "User": map[string]interface{}{
+                "FullName":         user.FullName,
+                "Email":            user.Email,
+                "Phone":            user.Phone,
+                "Role":             user.Role,
+                "PhoneVerified":    user.PhoneVerified,
+                "EmailVerified":    user.EmailVerified,
+                "Status":           user.Status,
+                "ProfilePicturePath": user.ProfilePicturePath,
+            },
+        }
+        response = append(response, expertData)
+    }
+
     json.NewEncoder(w).Encode(map[string]interface{}{
-        "experts":     experts,
+        "experts":     response,
         "total":       total,
         "page":        page,
         "page_size":   pageSize,
@@ -949,16 +989,43 @@ func (h *Handler) GetExpert(w http.ResponseWriter, r *http.Request) {
     }
 
     var expert models.Expert
-    result := h.db.Preload("User").
-        Preload("CertificationFiles").
-        First(&expert, expertID)
+    result := h.db.Preload("User").           // Preload User fields
+        Preload("CertificationFiles").         // Preload CertificationFiles
+        First(&expert, expertID)               // Get the expert by ID
     if result.Error != nil {
         http.Error(w, "Expert not found", http.StatusNotFound)
         return
     }
 
+    // Access the preloaded User data
+    user := expert.User
+
+    // Construct response including both expert and user data
+    expertData := map[string]interface{}{
+        "ID":               expert.ID,
+        "CreatedAt":        expert.CreatedAt,
+        "UpdatedAt":        expert.UpdatedAt,
+        "UserID":           expert.UserID,
+        "Expertise":        expert.Expertise,
+        "Bio":              expert.Bio,
+        "Verified":         expert.Verified,
+        "CertificationFiles": expert.CertificationFiles,
+        "User": map[string]interface{}{
+            "FullName":         user.FullName,
+            "Email":            user.Email,
+            "Phone":            user.Phone,
+            "Role":             user.Role,
+            "PhoneVerified":    user.PhoneVerified,
+            "EmailVerified":    user.EmailVerified,
+            "Status":           user.Status,
+            "ProfilePicturePath": user.ProfilePicturePath,
+        },
+    }
+
+    // Return the response
     w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(expert)
+    w.WriteHeader(http.StatusOK)
+    json.NewEncoder(w).Encode(expertData)
 }
 
 // UpdateExpert allows updating expert profile information

@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/KAsare1/Kodefx-server/cmd/api"
@@ -14,7 +15,7 @@ import (
 )
 
 func main() {
-	// Check for command-line arguments
+    // Check for command-line arguments
     if len(os.Args) > 1 {
         switch os.Args[1] {
         case "migrate":
@@ -28,8 +29,8 @@ func main() {
         }
     }
 
-	// Start the server
-	startServer()
+    // Start the server
+    startServer()
 }
 
 func runMigrations() {
@@ -140,28 +141,32 @@ func startServer() {
 }
 
 
-func clearDatabase(DB *gorm.DB) error {
-    // List of models to clear, in the order they should be cleared 
-    // (to respect foreign key constraints)
-    models := []interface{}{
-        &models.Like{},
-        &models.Comment{},
-        &models.Share{},
-        &models.Message{},
-        &models.Appointment{},
-        &models.Availability{},
-        &models.Post{},
-        &models.Image{},
-        &models.CertificationFile{},
-        &models.PasswordResetToken{},
-        &models.Expert{},
-        &models.User{},
+func clearDatabase(DB *gorm.DB, tables []interface{}) error {
+    if len(tables) == 0 {
+        // Default: Drop all tables
+        tables = []interface{}{
+            &models.Like{},
+            &models.Comment{},
+            &models.Share{},
+            &models.Message{},
+            &models.Appointment{},
+            &models.Availability{},
+            &models.Post{},
+            &models.Image{},
+            &models.CertificationFile{},
+            &models.PasswordResetToken{},
+            &models.Expert{},
+            &models.User{},
+        }
     }
 
-    log.Println("Dropping existing tables...")
-    for _, table := range models {
+    log.Println("Dropping tables...")
+
+    for _, table := range tables {
         if err := DB.Migrator().DropTable(table); err != nil {
-            log.Printf("Warning dropping table: %v", err)
+            log.Printf("Warning dropping table %T: %v", table, err)
+        } else {
+            log.Printf("Table %T dropped", table)
         }
     }
 
@@ -180,20 +185,68 @@ func runDatabaseClear() {
     }()
 
     log.Println("Preparing to clear database...")
-    
+
     // Optional: Add a confirmation prompt
     var confirmation string
-    fmt.Print("Are you sure you want to clear the entire database? (yes/no): ")
+    fmt.Print("Are you sure you want to clear the database? (yes/no): ")
     fmt.Scanln(&confirmation)
-    
+
     if confirmation != "yes" {
         log.Println("Database clearing cancelled.")
         return
     }
 
-    if err := clearDatabase(DB); err != nil {
+    // Ask for specific tables to clear
+    var tableNames string
+    fmt.Print("Enter table names to clear (comma separated) or leave blank to clear all: ")
+    fmt.Scanln(&tableNames)
+
+    var tables []interface{}
+    if tableNames != "" {
+        tableList := splitTableNames(tableNames)
+        for _, table := range tableList {
+            switch table {
+            case "User":
+                tables = append(tables, &models.User{})
+            case "Expert":
+                tables = append(tables, &models.Expert{})
+            case "Availability":
+                tables = append(tables, &models.Availability{})
+            case "Appointment":
+                tables = append(tables, &models.Appointment{})
+            case "Post":
+                tables = append(tables, &models.Post{})
+            case "Image":
+                tables = append(tables, &models.Image{})
+            case "Comment":
+                tables = append(tables, &models.Comment{})
+            case "Like":
+                tables = append(tables, &models.Like{})
+            case "Share":
+                tables = append(tables, &models.Share{})
+            case "Message":
+                tables = append(tables, &models.Message{})
+            case "CertificationFile":
+                tables = append(tables, &models.CertificationFile{})
+            case "PasswordResetToken":
+                tables = append(tables, &models.PasswordResetToken{})
+            default:
+                log.Printf("Unknown table: %s", table)
+            }
+        }
+    }
+
+    // Clear the specified tables (or all tables if none specified)
+    if err := clearDatabase(DB, tables); err != nil {
         log.Fatalf("Error clearing database: %v", err)
     }
 
     log.Println("Database cleared successfully")
 }
+
+func splitTableNames(tableNames string) []string {
+    return strings.Split(tableNames, ",")
+}
+
+
+

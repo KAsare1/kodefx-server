@@ -1,9 +1,18 @@
 package appointment
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha512"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
+	"time"
 
 	"github.com/KAsare1/Kodefx-server/cmd/models"
 	"github.com/gorilla/mux"
@@ -27,6 +36,10 @@ func (h *AppointmentHandler) RegisterRoutes(router *mux.Router) {
     router.HandleFunc("/appointments/trader/{traderId}", h.GetTraderAppointments).Methods("GET")
     router.HandleFunc("/appointments/expert/{expertId}", h.GetExpertAppointments).Methods("GET")
     router.HandleFunc("/appointments/{id}/payment", h.UpdatePaymentStatus).Methods("PATCH")
+
+    router.HandleFunc("/appointments/initialize-payment", h.InitializeAppointmentPayment).Methods("POST")
+    router.HandleFunc("/appointments/webhook", h.HandlePaystackWebhook).Methods("POST")
+    
 }
 
 
@@ -103,7 +116,7 @@ func (h *AppointmentHandler) GetAllAppointments(w http.ResponseWriter, r *http.R
     if page < 1 {
         page = 1
     }
-    pageSize := 10
+    pageSize := 100
 
     query := h.db.Model(&models.Appointment{}).Preload("Trader").Preload("Expert")
 
@@ -211,7 +224,7 @@ func (h *AppointmentHandler) GetTraderAppointments(w http.ResponseWriter, r *htt
     if page < 1 {
         page = 1
     }
-    pageSize := 10
+    pageSize := 100
 
     query := h.db.Model(&models.Appointment{}).Where("trader_id = ?", traderID).
         Preload("Expert").Preload("Availability")
@@ -249,7 +262,7 @@ func (h *AppointmentHandler) GetExpertAppointments(w http.ResponseWriter, r *htt
     if page < 1 {
         page = 1
     }
-    pageSize := 10
+    pageSize := 100
 
     query := h.db.Model(&models.Appointment{}).Where("expert_id = ?", expertID).
         Preload("Trader").Preload("Availability")
@@ -312,4 +325,220 @@ func (h *AppointmentHandler) UpdatePaymentStatus(w http.ResponseWriter, r *http.
     json.NewEncoder(w).Encode(map[string]string{
         "message": "Payment status updated successfully",
     })
+}
+
+
+
+
+
+
+
+
+type PaystackInitializeResponse struct {
+    Status  bool `json:"status"`
+    Data    struct {
+        AuthorizationURL string `json:"authorization_url"`
+        AccessCode      string `json:"access_code"`
+        Reference      string `json:"reference"`
+    } `json:"data"`
+}
+
+type PaystackWebhookPayload struct {
+    Event string `json:"event"`
+    Data  struct {
+        Reference  string `json:"reference"`
+        Status    string `json:"status"`
+        Amount    float64 `json:"amount"`
+    } `json:"data"`
+}
+
+func (h *AppointmentHandler) InitializeAppointmentPayment(w http.ResponseWriter, r *http.Request) {
+    var initRequest struct {
+        TraderID       uint    `json:"trader_id"`
+        AvailabilityID uint    `json:"availability_id"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&initRequest); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
+
+    // Start transaction
+    tx := h.db.Begin()
+
+    // Check availability
+    var availability models.Availability
+    if err := tx.First(&availability, initRequest.AvailabilityID).Error; err != nil {
+        tx.Rollback()
+        http.Error(w, "Time slot not found", http.StatusNotFound)
+        return
+    }
+
+    // Check for existing appointments
+    var existingAppointment models.Appointment
+    if err := tx.Where("availability_id = ? AND status != ?", initRequest.AvailabilityID, "Cancelled").
+        First(&existingAppointment).Error; err == nil {
+        tx.Rollback()
+        http.Error(w, "Time slot already booked", http.StatusConflict)
+        return
+    }
+
+    // Create pending appointment
+    appointment := models.Appointment{
+        TraderID:        initRequest.TraderID,
+        ExpertID:        availability.ExpertID,
+        AvailabilityID:  initRequest.AvailabilityID,
+        AppointmentDate: availability.Date,
+        StartTime:       availability.StartTime,
+        EndTime:         availability.EndTime,
+        Status:          "Pending",
+        PaymentStatus:   "pending",
+        Amount:          availability.Price,
+        EventName:       availability.EventName,
+        Category:        availability.Category,
+    }
+
+    if err := tx.Create(&appointment).Error; err != nil {
+        tx.Rollback()
+        http.Error(w, "Error creating appointment", http.StatusInternalServerError)
+        return
+    }
+
+    // Initialize Paystack payment
+    paystackURL := "https://api.paystack.co/transaction/initialize"
+    var trader models.User
+    if err := tx.First(&trader, initRequest.TraderID).Error; err != nil {
+        tx.Rollback()
+        http.Error(w, "Trader not found", http.StatusNotFound)
+        return
+    }
+
+    reference := fmt.Sprintf("APT-%d-%d", appointment.ID, time.Now().Unix())
+
+    paystackReq := map[string]interface{}{
+        "email": trader.Email,
+        "amount": int64(availability.Price * 100), // Convert price to smallest unit
+        "reference": reference,
+        "metadata": map[string]interface{}{
+            "appointment_id": appointment.ID,
+            "trader_id": initRequest.TraderID,
+            "expert_id": availability.ExpertID,
+        },
+    }
+    log.Printf("Payload to Paystack: %+v\n", paystackReq)
+
+    payloadBytes, _ := json.Marshal(paystackReq)
+    req, _ := http.NewRequest("POST", paystackURL, bytes.NewBuffer(payloadBytes))
+    req.Header.Set("Authorization", "Bearer "+os.Getenv("PAYSTACK_SECRET_KEY"))
+    req.Header.Set("Content-Type", "application/json")
+
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        tx.Rollback()
+        http.Error(w, "Error initializing payment", http.StatusInternalServerError)
+        return
+    }
+    defer resp.Body.Close()
+
+    var paystackResp struct {
+        Status  bool `json:"status"`
+        Data    struct {
+            AuthorizationURL string `json:"authorization_url"`
+            AccessCode      string `json:"access_code"`
+            Reference      string `json:"reference"`
+        } `json:"data"`
+    }
+
+    if err := json.NewDecoder(resp.Body).Decode(&paystackResp); err != nil {
+        tx.Rollback()
+        http.Error(w, "Error reading payment response", http.StatusInternalServerError)
+        return
+    }
+
+    // Update appointment with payment reference
+    appointment.PaymentID = reference
+    if err := tx.Save(&appointment).Error; err != nil {
+        tx.Rollback()
+        http.Error(w, "Error updating appointment", http.StatusInternalServerError)
+        return
+    }
+
+    if err := tx.Commit().Error; err != nil {
+        http.Error(w, "Error completing initialization", http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "authorization_url": paystackResp.Data.AuthorizationURL,
+        "reference": reference,
+        "appointment_id": appointment.ID,
+    })
+}
+
+// HandlePaystackWebhook processes the payment webhook from Paystack
+func (h *AppointmentHandler) HandlePaystackWebhook(w http.ResponseWriter, r *http.Request) {
+    // Verify Paystack webhook signature
+    paystackSignature := r.Header.Get("X-Paystack-Signature")
+    body, err := io.ReadAll(r.Body)
+    if err != nil {
+        http.Error(w, "Error reading request body", http.StatusBadRequest)
+        return
+    }
+
+    // Verify signature
+    mac := hmac.New(sha512.New, []byte(os.Getenv("PAYSTACK_SECRET_KEY")))
+    mac.Write(body)
+    expectedMAC := hex.EncodeToString(mac.Sum(nil))
+    if !hmac.Equal([]byte(paystackSignature), []byte(expectedMAC)) {
+        http.Error(w, "Invalid signature", http.StatusBadRequest)
+        return
+    }
+
+    var webhookPayload struct {
+        Event string `json:"event"`
+        Data  struct {
+            Reference  string `json:"reference"`
+            Status    string `json:"status"`
+            Amount    float64 `json:"amount"`
+        } `json:"data"`
+    }
+
+    if err := json.Unmarshal(body, &webhookPayload); err != nil {
+        http.Error(w, "Error parsing webhook payload", http.StatusBadRequest)
+        return
+    }
+
+    // Only process successful charge events
+    if webhookPayload.Event != "charge.success" {
+        w.WriteHeader(http.StatusOK)
+        return
+    }
+
+    tx := h.db.Begin()
+
+    // Find and update appointment
+    var appointment models.Appointment
+    if err := tx.Where("payment_id = ?", webhookPayload.Data.Reference).First(&appointment).Error; err != nil {
+        tx.Rollback()
+        http.Error(w, "Appointment not found", http.StatusNotFound)
+        return
+    }
+
+    // Update appointment status
+    appointment.PaymentStatus = "paid"
+    appointment.Status = "Confirmed"
+    if err := tx.Save(&appointment).Error; err != nil {
+        tx.Rollback()
+        http.Error(w, "Error updating appointment", http.StatusInternalServerError)
+        return
+    }
+
+    if err := tx.Commit().Error; err != nil {
+        http.Error(w, "Error completing webhook processing", http.StatusInternalServerError)
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
 }

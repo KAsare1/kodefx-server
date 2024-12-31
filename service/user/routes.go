@@ -897,6 +897,11 @@ func (h *Handler) handleVerifyResetToken(w http.ResponseWriter, r *http.Request)
 
 
 func (h *Handler) GetExperts(w http.ResponseWriter, r *http.Request) {
+    if h.db == nil {
+        http.Error(w, "Database connection not initialized", http.StatusInternalServerError)
+        return
+    }
+
     // Parse query parameters
     verified := r.URL.Query().Get("verified")
     page, err := strconv.Atoi(r.URL.Query().Get("page"))
@@ -907,8 +912,8 @@ func (h *Handler) GetExperts(w http.ResponseWriter, r *http.Request) {
 
     // Base query with both User and CertificationFiles preloaded
     query := h.db.Model(&models.Expert{}).
-        Preload("User").        // Preload User fields
-        Preload("CertificationFiles") // Preload CertificationFiles
+        Preload("User").
+        Preload("CertificationFiles")
 
     // Filter by verification status if specified
     if verified != "" {
@@ -920,13 +925,16 @@ func (h *Handler) GetExperts(w http.ResponseWriter, r *http.Request) {
         query = query.Where("verified = ?", isVerified)
     }
 
-    // Pagination
+    // Count total records
     var total int64
-    query.Count(&total)
+    if err := query.Count(&total).Error; err != nil {
+        http.Error(w, "Error counting experts", http.StatusInternalServerError)
+        return
+    }
 
+    // Fetch paginated experts
     var experts []models.Expert
     result := query.Offset((page - 1) * pageSize).Limit(pageSize).Find(&experts)
-
     if result.Error != nil {
         http.Error(w, "Error retrieving experts", http.StatusInternalServerError)
         return
@@ -934,41 +942,49 @@ func (h *Handler) GetExperts(w http.ResponseWriter, r *http.Request) {
 
     // Check if there are no experts
     if len(experts) == 0 {
-        http.Error(w, "No experts found", http.StatusNotFound)
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "experts":     []interface{}{},
+            "total":      0,
+            "page":       page,
+            "page_size":  pageSize,
+            "total_pages": 0,
+        })
         return
     }
 
-    // Return the response
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(http.StatusOK)
-
-    // Construct a response that includes both the expert and user data
-    response := []map[string]interface{}{}
+    // Construct response
+    response := make([]map[string]interface{}, 0, len(experts))
     for _, expert := range experts {
-        user := expert.User  // Access the preloaded User data
+        if expert.User == nil {
+            continue // Skip if User is nil
+        }
+
         expertData := map[string]interface{}{
-            "ID":               expert.ID,
-            "CreatedAt":        expert.CreatedAt,
-            "UpdatedAt":        expert.UpdatedAt,
+            "ID":                expert.ID,
+            "CreatedAt":         expert.CreatedAt,
+            "UpdatedAt":         expert.UpdatedAt,
             "UserID":           expert.UserID,
             "Expertise":        expert.Expertise,
             "Bio":              expert.Bio,
             "Verified":         expert.Verified,
             "CertificationFiles": expert.CertificationFiles,
             "User": map[string]interface{}{
-                "FullName":         user.FullName,
-                "Email":            user.Email,
-                "Phone":            user.Phone,
-                "Role":             user.Role,
-                "PhoneVerified":    user.PhoneVerified,
-                "EmailVerified":    user.EmailVerified,
-                "Status":           user.Status,
-                "ProfilePicturePath": user.ProfilePicturePath,
+                "FullName":           expert.User.FullName,
+                "Email":             expert.User.Email,
+                "Phone":             expert.User.Phone,
+                "Role":              expert.User.Role,
+                "PhoneVerified":     expert.User.PhoneVerified,
+                "EmailVerified":     expert.User.EmailVerified,
+                "Status":            expert.User.Status,
+                "ProfilePicturePath": expert.User.ProfilePicturePath,
             },
         }
         response = append(response, expertData)
     }
 
+    // Return the response
+    w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(map[string]interface{}{
         "experts":     response,
         "total":       total,
@@ -980,8 +996,18 @@ func (h *Handler) GetExperts(w http.ResponseWriter, r *http.Request) {
 
 // GetExpert retrieves a specific expert by ID with full details
 func (h *Handler) GetExpert(w http.ResponseWriter, r *http.Request) {
+    if h.db == nil {
+        http.Error(w, "Database connection not initialized", http.StatusInternalServerError)
+        return
+    }
+
     // Parse expert ID from URL
     vars := mux.Vars(r)
+    if vars == nil {
+        http.Error(w, "Missing URL parameters", http.StatusBadRequest)
+        return
+    }
+
     expertID, err := strconv.ParseUint(vars["id"], 10, 64)
     if err != nil {
         http.Error(w, "Invalid expert ID", http.StatusBadRequest)
@@ -989,42 +1015,49 @@ func (h *Handler) GetExpert(w http.ResponseWriter, r *http.Request) {
     }
 
     var expert models.Expert
-    result := h.db.Preload("User").           // Preload User fields
-        Preload("CertificationFiles").         // Preload CertificationFiles
-        First(&expert, expertID)               // Get the expert by ID
+    result := h.db.Preload("User").
+        Preload("CertificationFiles").
+        First(&expert, expertID)
+
     if result.Error != nil {
-        http.Error(w, "Expert not found", http.StatusNotFound)
+        if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+            http.Error(w, "Expert not found", http.StatusNotFound)
+        } else {
+            http.Error(w, "Error retrieving expert", http.StatusInternalServerError)
+        }
         return
     }
 
-    // Access the preloaded User data
-    user := expert.User
+    // Check if User is nil before accessing
+    if expert.User == nil {
+        http.Error(w, "Expert user data not found", http.StatusInternalServerError)
+        return
+    }
 
     // Construct response including both expert and user data
     expertData := map[string]interface{}{
-        "ID":               expert.ID,
-        "CreatedAt":        expert.CreatedAt,
-        "UpdatedAt":        expert.UpdatedAt,
+        "ID":                expert.ID,
+        "CreatedAt":         expert.CreatedAt,
+        "UpdatedAt":         expert.UpdatedAt,
         "UserID":           expert.UserID,
         "Expertise":        expert.Expertise,
         "Bio":              expert.Bio,
         "Verified":         expert.Verified,
         "CertificationFiles": expert.CertificationFiles,
         "User": map[string]interface{}{
-            "FullName":         user.FullName,
-            "Email":            user.Email,
-            "Phone":            user.Phone,
-            "Role":             user.Role,
-            "PhoneVerified":    user.PhoneVerified,
-            "EmailVerified":    user.EmailVerified,
-            "Status":           user.Status,
-            "ProfilePicturePath": user.ProfilePicturePath,
+            "FullName":           expert.User.FullName,
+            "Email":             expert.User.Email,
+            "Phone":             expert.User.Phone,
+            "Role":              expert.User.Role,
+            "PhoneVerified":     expert.User.PhoneVerified,
+            "EmailVerified":     expert.User.EmailVerified,
+            "Status":            expert.User.Status,
+            "ProfilePicturePath": expert.User.ProfilePicturePath,
         },
     }
 
     // Return the response
     w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(http.StatusOK)
     json.NewEncoder(w).Encode(expertData)
 }
 

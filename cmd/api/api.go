@@ -9,9 +9,9 @@ import (
 	"github.com/KAsare1/Kodefx-server/service/availability"
 	"github.com/KAsare1/Kodefx-server/service/forum"
 	"github.com/KAsare1/Kodefx-server/service/user"
+	service "github.com/KAsare1/Kodefx-server/service/ws"
 	"github.com/gorilla/mux"
 	"gorm.io/gorm"
-
 )
 
 type APIServer struct {
@@ -25,6 +25,7 @@ func NewApiServer(address string, db *gorm.DB) *APIServer {
 		db:      db,
 	}
 }
+
 
 func (s *APIServer) Run() error {
 	router := mux.NewRouter()
@@ -43,10 +44,16 @@ func (s *APIServer) Run() error {
 	forumHandler := forum.NewPostHandler(s.db)
     forumHandler.RegisterRoutes(subrouter)
 
-	// wsHandler := service.NewWebSocketHandler(s.db)
-	// wsHandler.RegisterRoutes(subrouter)
+    chatHandler := service.NewChatHandler(s.db)
+    chatHandler.RegisterRoutes(subrouter)
+
+
 
 
 	log.Println("Server running at", s.address)
 	return http.ListenAndServe(s.address, router)
 }
+
+
+
+

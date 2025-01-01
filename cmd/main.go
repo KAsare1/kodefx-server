@@ -64,9 +64,12 @@ func performMigrations(DB *gorm.DB) error {
 		&models.Comment{}:           "Comment",
 		&models.Like{}:              "Like",
 		&models.Share{}:             "Share",
-		&models.Message{}:           "Message",
+		&models.PeerMessage{}:           "Message",
 		&models.CertificationFile{}: "CertificationFile",
         &models.PasswordResetToken{}: "PasswordResetToken",
+        &models.Channel{}:           "Channel",
+		&models.ChannelMessage{}:    "ChannelMessage",
+		&models.Client{}:            "Client",
 	}
 
 	log.Println("Starting database migrations...")
@@ -148,7 +151,7 @@ func clearDatabase(DB *gorm.DB, tables []interface{}) error {
             &models.Like{},
             &models.Comment{},
             &models.Share{},
-            &models.Message{},
+            &models.PeerMessage{},
             &models.Appointment{},
             &models.Availability{},
             &models.Post{},
@@ -157,6 +160,10 @@ func clearDatabase(DB *gorm.DB, tables []interface{}) error {
             &models.PasswordResetToken{},
             &models.Expert{},
             &models.User{},
+
+            &models.Channel{},           
+            &models.ChannelMessage{},  
+            &models.Client{},     
         }
     }
 
@@ -225,11 +232,17 @@ func runDatabaseClear() {
             case "Share":
                 tables = append(tables, &models.Share{})
             case "Message":
-                tables = append(tables, &models.Message{})
+                tables = append(tables, &models.PeerMessage{})
             case "CertificationFile":
                 tables = append(tables, &models.CertificationFile{})
             case "PasswordResetToken":
                 tables = append(tables, &models.PasswordResetToken{})
+            case "Channel":
+                tables = append(tables, &models.Channel{})
+            case "ChannelMessage":
+                tables = append(tables, &models.ChannelMessage{})
+            case "Client":
+                tables = append(tables, &models.Client{})
             default:
                 log.Printf("Unknown table: %s", table)
             }

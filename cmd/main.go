@@ -7,6 +7,8 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+    _ "net/http/pprof"
+	"net/http"
 
 	"github.com/KAsare1/Kodefx-server/cmd/api"
 	"github.com/KAsare1/Kodefx-server/cmd/models"
@@ -132,6 +134,15 @@ func startServer() {
 		port = "8080"
 	}
 	server := api.NewApiServer(":"+port, DB)
+
+	// Start the pprof server for profiling
+	go func() {
+		log.Println("Starting pprof server on :6060")
+		if err := http.ListenAndServe(":6060", nil); err != nil {
+			log.Printf("pprof server error: %v", err)
+		}
+	}()
+
 	go func() {
 		if err := server.Run(); err != nil {
 			log.Fatalf("Server error: %v", err)

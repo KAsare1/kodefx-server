@@ -12,36 +12,48 @@ import (
 
 
 // PeerMessage model for direct messages between users
-type PeerMessage struct {
-	gorm.Model
-	SenderID   uint      `gorm:"column:sender_id;not null" json:"sender_id"`
-	ReceiverID uint      `gorm:"column:receiver_id;not null" json:"receiver_id"`
-	Content    string    `gorm:"column:content;type:text;not null" json:"content"`
-	ReadAt     time.Time `gorm:"column:read_at" json:"read_at,omitempty"`
+type MessageContentType string
 
-	// Relations
-	Sender   *User `gorm:"foreignKey:SenderID" json:"sender,omitempty"`
-	Receiver *User `gorm:"foreignKey:ReceiverID" json:"receiver,omitempty"`
+const (
+    TextContent  MessageContentType = "text"
+    ImageContent MessageContentType = "image"
+)
+
+// PeerMessage struct for direct messages between users
+type PeerMessage struct {
+    gorm.Model
+    SenderID     uint              `gorm:"column:sender_id;not null" json:"sender_id"`
+    ReceiverID   uint              `gorm:"column:receiver_id;not null" json:"receiver_id"`
+    ContentType  MessageContentType `gorm:"column:content_type;not null;default:'text'" json:"content_type"`
+    Content      string            `gorm:"column:content;type:text;not null" json:"content"`
+    ImageURL     string            `gorm:"column:image_url;type:text" json:"image_url,omitempty"`
+    ReadAt       time.Time         `gorm:"column:read_at" json:"read_at,omitempty"`
+
+    // Relations
+    Sender   *User `gorm:"foreignKey:SenderID" json:"sender,omitempty"`
+    Receiver *User `gorm:"foreignKey:ReceiverID" json:"receiver,omitempty"`
 }
 
 func (PeerMessage) TableName() string {
-	return "peer_messages"
+    return "peer_messages"
 }
 
 // ChannelMessage model for messages in channels
 type ChannelMessage struct {
-	gorm.Model
-	ChannelID uint      `gorm:"column:channel_id;not null" json:"channel_id"`
-	SenderID  uint      `gorm:"column:sender_id;not null" json:"sender_id"`
-	Content   string    `gorm:"column:content;type:text;not null" json:"content"`
+    gorm.Model
+    ChannelID   uint              `gorm:"column:channel_id;not null" json:"channel_id"`
+    SenderID    uint              `gorm:"column:sender_id;not null" json:"sender_id"`
+    ContentType MessageContentType `gorm:"column:content_type;not null;default:'text'" json:"content_type"`
+    Content     string            `gorm:"column:content;type:text;not null" json:"content"`
+    ImageURL    string            `gorm:"column:image_url;type:text" json:"image_url,omitempty"`
 
-	// Relations
-	Sender  *User    `gorm:"foreignKey:SenderID" json:"sender,omitempty"`
-	Channel *Channel `gorm:"foreignKey:ChannelID" json:"channel,omitempty"`
+    // Relations
+    Sender  *User    `gorm:"foreignKey:SenderID" json:"sender,omitempty"`
+    Channel *Channel `gorm:"foreignKey:ChannelID" json:"channel,omitempty"`
 }
 
 func (ChannelMessage) TableName() string {
-	return "channel_messages"
+    return "channel_messages"
 }
 
 // Channel model for group chats
@@ -50,6 +62,8 @@ type Channel struct {
 	Name        string    `gorm:"column:name;not null" json:"name"`
 	Description string    `gorm:"column:description;type:text;not null" json:"description"`
 	Clients     []*Client `gorm:"many2many:channel_clients" json:"clients,omitempty"`
+	Admins	  []*Client   `gorm:"many2many:channel_admins" json:"admins,omitempty"`
+	ChannelImage string `gorm:"column:channel_image;size:255" json:"channel_image"`
 }
 
 func (Channel) TableName() string {

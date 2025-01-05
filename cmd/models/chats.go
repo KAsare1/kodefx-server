@@ -66,6 +66,7 @@ type Channel struct {
 	ChannelImage string `gorm:"column:channel_image;size:255" json:"channel_image"`
 }
 
+
 func (Channel) TableName() string {
 	return "channels"
 }

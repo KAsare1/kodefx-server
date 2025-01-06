@@ -45,7 +45,7 @@ var upgrader = websocket.Upgrader{
 
 func (h *ChatHandler) RegisterRoutes(router *mux.Router, ) {
 	// WebSocket connection
-	router.HandleFunc("/ws", utils.AuthMiddleware(h.HandleWebSocket))
+	router.HandleFunc("/ws/{id}", h.HandleWebSocket)
 
 	// Channel routes
 	router.HandleFunc("/channels", utils.AuthMiddleware(h.CreateChannel)).Methods("POST")
@@ -70,11 +70,12 @@ func (h *ChatHandler) RegisterRoutes(router *mux.Router, ) {
 func (h *ChatHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
     log.Println("WebSocket connection request received")
 
-    userID, err := utils.GetUserIDFromContext(r.Context())
-    if err != nil {
-        http.Error(w, "Unauthorized", http.StatusUnauthorized)
-        return
-    }
+	vars := mux.Vars(r)
+	UserID, err := strconv.ParseUint(vars["id"], 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid user ID", http.StatusBadRequest)
+		return
+	}
 
     conn, err := upgrader.Upgrade(w, r, nil)
     if err != nil {
@@ -82,20 +83,20 @@ func (h *ChatHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    log.Printf("WebSocket connection established for user %d\n", userID)
+    log.Printf("WebSocket connection established for user %d\n", UserID)
 
     client := &models.ClientConnection{
         Hub:    h.hub,
         Conn:   conn,
         Send:   make(chan []byte, 256),
-        UserID: userID,
+        UserID: uint(UserID),
     }
 
     // Subscribe to all channels the user is a member of
     var channels []models.Channel
     if err := h.db.Joins("JOIN channel_clients ON channels.id = channel_clients.channel_id").
         Joins("JOIN clients ON channel_clients.client_id = clients.id").
-        Where("clients.user_id = ?", userID).
+        Where("clients.user_id = ?", UserID).
         Find(&channels).Error; err == nil {
         for _, channel := range channels {
             h.hub.SubscribeToChannel(channel.ID, client)

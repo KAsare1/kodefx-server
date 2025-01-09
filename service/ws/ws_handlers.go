@@ -39,7 +39,7 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true // You might want to implement proper origin checking
+		return true 
 	},
 }
 
@@ -51,10 +51,7 @@ func (h *ChatHandler) RegisterRoutes(router *mux.Router, ) {
 	router.HandleFunc("/channels", utils.AuthMiddleware(h.CreateChannel)).Methods("POST")
 	router.HandleFunc("/channels", h.GetChannels).Methods("GET")
 	router.HandleFunc("/channels/{id}", h.GetChannel).Methods("GET")
-	// router.HandleFunc("/channels/{id}", utils.AuthMiddleware(h.UpdateChannel)).Methods("PUT")
-	// router.HandleFunc("/channels/{id}", utils.AuthMiddleware(h.DeleteChannel)).Methods("DELETE")
 	router.HandleFunc("/channels/{id}/join", utils.AuthMiddleware(h.JoinChannel)).Methods("POST")
-	// router.HandleFunc("/channels/{id}/leave", utils.AuthMiddleware(h.LeaveChannel)).Methods("POST")
 	router.HandleFunc("/channels/{id}/members", utils.AuthMiddleware(h.GetChannelMembers)).Methods("GET")
 	router.HandleFunc("/channels/{id}/admins", utils.AuthMiddleware(h.GetChannelAdmins)).Methods("GET")
     router.HandleFunc("/channels/{id}/admins", utils.AuthMiddleware(h.AddChannelAdmin)).Methods("POST")

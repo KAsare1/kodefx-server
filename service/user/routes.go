@@ -1,6 +1,7 @@
 package user
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
@@ -13,12 +14,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v4"
 	"gopkg.in/gomail.v2"
 
-	"github.com/GetStream/stream-chat-go/v5"
 	"github.com/KAsare1/Kodefx-server/cmd/models"
 	"github.com/gorilla/mux"
 	"golang.org/x/crypto/bcrypt"
@@ -154,97 +155,103 @@ func getContentType(filename string) string {
 }
 
 
-func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
-    var loginRequest struct {
-        Email    string `json:"email"`
-        Password string `json:"password"`
-    }
+type LoginRequest struct {
+    Email    string `json:"email"`
+    Password string `json:"password"`
+}
 
+type LoginResponse struct {
+    Message       string `json:"message"`
+    AccessToken   string `json:"access_token"`
+    RefreshToken  string `json:"refresh_token"`
+    UserID        uint   `json:"user_id"`
+    ExpertID      *uint  `json:"expert_id,omitempty"`
+}
+
+func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
+    var loginRequest LoginRequest
+    
+    // Limit request body size to prevent potential DoS
+    r.Body = http.MaxBytesReader(w, r.Body, 1048576) // 1MB limit
+    
     if err := json.NewDecoder(r.Body).Decode(&loginRequest); err != nil {
         http.Error(w, "Invalid request body", http.StatusBadRequest)
         return
     }
 
+    // Use prepared statement or cached query
     var user models.User
-    result := h.db.Where("email = ?", loginRequest.Email).First(&user)
+    result := h.db.Preload("Expert").
+        Where("email = ?", loginRequest.Email).
+        First(&user)
+    
+    
     if result.Error != nil {
         http.Error(w, "User not found", http.StatusUnauthorized)
-        return
+        return 
     }
 
-    // Verify password
-    if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(loginRequest.Password)); err != nil {
-        http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-        return
-    }
+    // Async password verification with timeout
+    ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+    defer cancel()
 
-    // Generate Access Token for your API
-    accessToken, err := generateJWT(user.ID, 7500) 
-    if err != nil {
-        http.Error(w, "Error generating access token", http.StatusInternalServerError)
-        return
-    }
+    passwordVerified := make(chan bool, 1)
+    go func() {
+        err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(loginRequest.Password))
+        passwordVerified <- err == nil
+    }()
 
-    // Generate Refresh Token
-    refreshToken, err := generateRefreshToken(user.ID)
-    if err != nil {
-        http.Error(w, "Error generating refresh token", http.StatusInternalServerError)
-        return
-    }
-
-    // Save Refresh Token to Database (optional for invalidation purposes)
-    err = saveRefreshToken(h.db, user.ID, refreshToken)
-    if err != nil {
-        http.Error(w, "Error saving refresh token", http.StatusInternalServerError)
-        return
-    }
-
-    // Initialize Stream Chat Client
-    API_KEY := os.Getenv("STREAM_API_KEY")
-    API_SECRET := os.Getenv("STREAM_API_SECRET")
-    streamClient, err := stream_chat.NewClient(API_KEY, API_SECRET)
-    if err != nil {
-        http.Error(w, "Error initializing Stream client", http.StatusInternalServerError)
-        return
-    }
-
-    // Convert user.ID to string
-    userIDStr := fmt.Sprintf("%d", user.ID)
-
-    // Generate a Stream Chat token
-    streamToken, err := streamClient.CreateToken(userIDStr, time.Now().Add(time.Hour * 24 * 365)) 
-    if err != nil {
-        http.Error(w, "Error generating Stream token", http.StatusInternalServerError)
-        return
-    }
-
-    // Prepare response
-    response := map[string]interface{}{
-        "message":        "Login successful",
-        "access_token":   accessToken,
-        "refresh_token":  refreshToken,
-        "user_id":        user.ID,
-        "stream_token":   streamToken,
-    }
-
-    // If user is an expert, fetch and include expert_id
-    if user.Role == "expert" {
-        var expert models.Expert
-        result := h.db.Where("user_id = ?", user.ID).First(&expert)
-        if result.Error == nil {
-            response["expert_id"] = expert.ID
-        } else if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
-            // Only return error if it's not a "not found" error
-            http.Error(w, "Error fetching expert profile", http.StatusInternalServerError)
+    select {
+    case verified := <-passwordVerified:
+        if !verified {
+            http.Error(w, "Invalid credentials", http.StatusUnauthorized)
             return
         }
+    case <-ctx.Done():
+        http.Error(w, "Authentication timeout", http.StatusRequestTimeout)
+        return
     }
 
-    // Respond with tokens and expert_id if applicable
+    // Parallel token generation
+    var wg sync.WaitGroup
+    var accessToken, refreshToken string
+    var tokenErr error
+
+    wg.Add(2)
+    go func() {
+        defer wg.Done()
+        accessToken, tokenErr = generateJWT(user.ID, 7500)
+    }()
+
+    go func() {
+        defer wg.Done()
+        refreshToken, tokenErr = generateRefreshToken(user.ID)
+    }()
+
+    wg.Wait()
+
+    if tokenErr != nil {
+        http.Error(w, "Token generation failed", http.StatusInternalServerError)
+        return
+    }
+
+    response := LoginResponse{
+        Message:       "Login successful",
+        AccessToken:   accessToken,
+        RefreshToken:  refreshToken,
+        UserID:        user.ID,
+        ExpertID:      nil, // Default to nil
+    }
+
+    // Conditionally set ExpertID if expert exists
+    if user.Expert != nil {
+        response.ExpertID = &user.Expert.ID
+    }
+
     w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusOK)
     json.NewEncoder(w).Encode(response)
 }
-
 
 
 

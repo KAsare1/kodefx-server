@@ -127,7 +127,7 @@ func startServer() {
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
 	// Start the API server
-	port := os.Getenv("SERVER_PORT")
+	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}

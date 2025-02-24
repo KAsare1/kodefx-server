@@ -131,7 +131,7 @@ func startServer() {
 	if port == "" {
 		port = "8080"
 	}
-	server := api.NewApiServer(":"+port, DB)
+	server := api.NewApiServer("0.0.0.0:"+port, DB)
 
 	go func() {
 		if err := server.Run(); err != nil {

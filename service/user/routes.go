@@ -1,26 +1,25 @@
 package user
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"math/rand"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v4"
 	"gopkg.in/gomail.v2"
 
-	"github.com/GetStream/stream-chat-go/v5"
 	"github.com/KAsare1/Kodefx-server/cmd/models"
 	"github.com/gorilla/mux"
 	"golang.org/x/crypto/bcrypt"
@@ -48,7 +47,7 @@ func (h *Handler) RegisterRoutes(router *mux.Router) {
 	router.HandleFunc("/users/{id}", h.DeleteUser).Methods("DELETE")
 	router.HandleFunc("/user/verify", h.verifyUser).Methods("POST")
 	router.HandleFunc("/refresh", h.handleRefreshToken).Methods("POST")
-    router.HandleFunc("/reset-password/{userId}", h.handlePasswordResetRequest).Methods("POST")
+    router.HandleFunc("/reset-password", h.handlePasswordResetRequest).Methods("POST")
     router.HandleFunc("/reset-password/{userId}/confirm", h.handlePasswordReset).Methods("POST")
 	router.HandleFunc("/verify-reset-token", h.handleVerifyResetToken).Methods("POST")
 	router.HandleFunc("/experts", h.GetExperts).Methods("GET")
@@ -156,156 +155,122 @@ func getContentType(filename string) string {
 }
 
 
-func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
-    var loginRequest struct {
-        Email    string `json:"email"`
-        Password string `json:"password"`
-    }
+type LoginRequest struct {
+    Email    string `json:"email"`
+    Password string `json:"password"`
+}
 
+type LoginResponse struct {
+    Message       string `json:"message"`
+    AccessToken   string `json:"access_token"`
+    RefreshToken  string `json:"refresh_token"`
+    UserID        uint   `json:"user_id"`
+    ExpertID      *uint  `json:"expert_id,omitempty"`
+}
+
+func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
+    var loginRequest LoginRequest
+    
+    // Limit request body size to prevent potential DoS
+    r.Body = http.MaxBytesReader(w, r.Body, 1048576) // 1MB limit
+    
     if err := json.NewDecoder(r.Body).Decode(&loginRequest); err != nil {
         http.Error(w, "Invalid request body", http.StatusBadRequest)
         return
     }
 
+    // Use prepared statement or cached query
     var user models.User
-    result := h.db.Where("email = ?", loginRequest.Email).First(&user)
+    result := h.db.Preload("Expert").
+        Where("email = ?", loginRequest.Email).
+        First(&user)
+    
+    
     if result.Error != nil {
         http.Error(w, "User not found", http.StatusUnauthorized)
+        return 
+    }
+
+    // Async password verification with timeout
+    ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+    defer cancel()
+
+    passwordVerified := make(chan bool, 1)
+    go func() {
+        err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(loginRequest.Password))
+        passwordVerified <- err == nil
+    }()
+
+    select {
+    case verified := <-passwordVerified:
+        if !verified {
+            http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+            return
+        }
+    case <-ctx.Done():
+        http.Error(w, "Authentication timeout", http.StatusRequestTimeout)
         return
     }
 
-    // Verify password
-    if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(loginRequest.Password)); err != nil {
-        http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+    // Parallel token generation
+    var wg sync.WaitGroup
+    var accessToken, refreshToken string
+    var tokenErr error
+
+    wg.Add(2)
+    go func() {
+        defer wg.Done()
+        accessToken, tokenErr = generateJWT(user.ID, 7500)
+    }()
+
+    go func() {
+        defer wg.Done()
+        refreshToken, tokenErr = generateRefreshToken(user.ID)
+    }()
+
+    wg.Wait()
+
+    if tokenErr != nil {
+        http.Error(w, "Token generation failed", http.StatusInternalServerError)
         return
     }
 
-    // Generate Access Token for your API
-    accessToken, err := generateJWT(user.ID, 7500) 
-    if err != nil {
-        http.Error(w, "Error generating access token", http.StatusInternalServerError)
-        return
+    response := LoginResponse{
+        Message:       "Login successful",
+        AccessToken:   accessToken,
+        RefreshToken:  refreshToken,
+        UserID:        user.ID,
+        ExpertID:      nil, // Default to nil
     }
 
-    // Generate Refresh Token
-    refreshToken, err := generateRefreshToken(user.ID)
-    if err != nil {
-        http.Error(w, "Error generating refresh token", http.StatusInternalServerError)
-        return
+    // Conditionally set ExpertID if expert exists
+    if user.Expert != nil {
+        response.ExpertID = &user.Expert.ID
     }
 
-    // Save Refresh Token to Database (optional for invalidation purposes)
-    err = saveRefreshToken(h.db, user.ID, refreshToken)
-    if err != nil {
-        http.Error(w, "Error saving refresh token", http.StatusInternalServerError)
-        return
-    }
-
-    // Initialize Stream Chat Client
-	API_KEY := os.Getenv("STREAM_API_KEY")
-	API_SECRET := os.Getenv("STREAM_API_SECRET")
-    streamClient, err := stream_chat.NewClient(API_KEY, API_SECRET)
-    if err != nil {
-        http.Error(w, "Error initializing Stream client", http.StatusInternalServerError)
-        return
-    }
-
-    // Convert user.ID to string
-    userIDStr := fmt.Sprintf("%d", user.ID)
-
-    // Generate a Stream Chat token
-    streamToken, err := streamClient.CreateToken(userIDStr, time.Now().Add(time.Hour * 24 * 365)) 
-    if err != nil {
-        http.Error(w, "Error generating Stream token", http.StatusInternalServerError)
-        return
-    }
-
-    // Respond with tokens
     w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(map[string]interface{}{
-        "message":        "Login successful",
-        "access_token":   accessToken,
-        "refresh_token":  refreshToken,
-        "user_id":        user.ID,
-        "stream_token":   streamToken, // Stream token for authenticating with the chat service
-    })
+    w.WriteHeader(http.StatusOK)
+    json.NewEncoder(w).Encode(response)
 }
 
 
-
-func (h *Handler) handleCertificationFile(tx *gorm.DB, file *multipart.FileHeader, expertID uint) error {
-    // Create uploads directory if it doesn't exist
-    uploadsDir := "uploads/certifications"
-    if err := os.MkdirAll(uploadsDir, 0755); err != nil {
-        return fmt.Errorf("failed to create uploads directory: %w", err)
-    }
-
-    // Generate a unique filename to prevent collisions
-    fileExt := filepath.Ext(file.Filename)
-    uniqueFilename := fmt.Sprintf("%d%s", time.Now().UnixNano(), fileExt)
-    filePath := filepath.Join(uploadsDir, uniqueFilename)
-
-    // Open source file
-    src, err := file.Open()
-    if err != nil {
-        return fmt.Errorf("failed to open uploaded file: %w", err)
-    }
-    defer src.Close()
-
-    // Create destination file
-    dst, err := os.Create(filePath)
-    if err != nil {
-        return fmt.Errorf("failed to create destination file: %w", err)
-    }
-    defer dst.Close()
-
-    // Copy file contents
-    if _, err = io.Copy(dst, src); err != nil {
-        return fmt.Errorf("failed to copy file contents: %w", err)
-    }
-
-    // Save file information to database
-    certificationFile := models.CertificationFile{
-        ExpertID: expertID,
-        FileName: file.Filename,
-        FilePath: filePath,
-    }
-
-    if err := tx.Create(&certificationFile).Error; err != nil {
-        // Clean up the file if database insertion fails
-        os.Remove(filePath)
-        return fmt.Errorf("failed to save file information to database: %w", err)
-    }
-
-    return nil
-}
 
 func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
-    // Parse form data
-    if err := r.ParseMultipartForm(10 << 20); err != nil { // Limit to 10MB
-        http.Error(w, "Error parsing form data", http.StatusBadRequest)
+    // Parse json data
+    var registerRequest struct {
+        FullName           string   `json:"full_name"`
+        Email              string   `json:"email"`
+        Password           string   `json:"password"`
+        Phone              string   `json:"phone"`
+        Role               string   `json:"role"`
+        Expertise          string   `json:"expertise"`
+        Bio                string   `json:"bio"`
+        CertificationFiles []string `json:"certification_files"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&registerRequest); err != nil {
+        http.Error(w, "Invalid JSON input", http.StatusBadRequest)
         return
     }
-
-    // Extract form values
-    registerRequest := struct {
-        FullName  string
-        Email     string
-        Password  string
-        Phone     string
-        Role      string
-        Expertise string
-        Bio       string
-    }{
-        FullName:  r.FormValue("full_name"),
-        Email:     r.FormValue("email"),
-        Password:  r.FormValue("password"),
-        Phone:     r.FormValue("phone"),
-        Role:      r.FormValue("role"),
-        Expertise: r.FormValue("expertise"),
-        Bio:       r.FormValue("bio"),
-    }
-
     // Validate required fields
     if registerRequest.FullName == "" || registerRequest.Email == "" || registerRequest.Password == "" || registerRequest.Phone == "" || registerRequest.Role == "" {
         http.Error(w, "Missing required fields", http.StatusBadRequest)
@@ -389,11 +354,14 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
         expertID = expert.ID
 
         // Handle certification files
-        files := r.MultipartForm.File["certification_files"]
-        for _, fileHeader := range files {
-            if err := h.handleCertificationFile(tx, fileHeader, expert.ID); err != nil {
+        for _, fileURL := range registerRequest.CertificationFiles {
+            certification := models.CertificationFile{
+                ExpertID: expertID,
+                FilePath:  fileURL,
+            }
+            if err := tx.Create(&certification).Error; err != nil {
                 tx.Rollback()
-                http.Error(w, "Error processing certification file", http.StatusInternalServerError)
+                http.Error(w, "Error saving certification URL", http.StatusInternalServerError)
                 return
             }
         }
@@ -424,6 +392,9 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
     json.NewEncoder(w).Encode(response)
 }
 
+
+
+
 // sendVerificationEmail sends a verification email with the 6-digit code
 func sendVerificationEmail(email, code string) error {
 	// Load SMTP configuration from environment variables
@@ -437,7 +408,7 @@ func sendVerificationEmail(email, code string) error {
 	m.SetHeader("From", smtpUser)
 	m.SetHeader("To", email)
 	m.SetHeader("Subject", "Email Verification Code")
-	m.SetBody("text/plain", fmt.Sprintf("Your verification code is: %s", code))
+	m.SetBody("text/plain", fmt.Sprintf("Your verification code is: %s. Ignore this email if you did not request a verification code.", code))
 
 	// Set up the dialer
 	port, err := strconv.Atoi(smtpPort)
@@ -532,14 +503,14 @@ func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
 }
 
 
-func createDirectoryIfNotExist(path string) error {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := os.MkdirAll(path, 0755); err != nil {
-			return fmt.Errorf("could not create directory %s: %w", path, err)
-		}
-	}
-	return nil
-}
+// func createDirectoryIfNotExist(path string) error {
+// 	if _, err := os.Stat(path); os.IsNotExist(err) {
+// 		if err := os.MkdirAll(path, 0755); err != nil {
+// 			return fmt.Errorf("could not create directory %s: %w", path, err)
+// 		}
+// 	}
+// 	return nil
+// }
 
 
 // UpdateUser updates user information
@@ -553,45 +524,13 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse multipart form data
-	if err := r.ParseMultipartForm(10 << 20); err != nil { // Limit to 10MB
-		http.Error(w, "Error parsing form data", http.StatusBadRequest)
-		return
+	var updateData struct {
+		FullName          string `json:"full_name"`
+		Phone             string `json:"phone"`
+		ProfilePictureURL string `json:"profile_picture_path"`
 	}
-
-	// Extract fields from form
-	fullName := r.FormValue("full_name")
-	phone := r.FormValue("phone")
-
-	// Handle file upload
-	var filePath string
-	file, handler, err := r.FormFile("profile_picture_path")
-	if err == nil { // If file exists
-		defer file.Close()
-
-		// Create upload directory if it doesn't exist
-		uploadPath := "uploads/images"
-		if err := createDirectoryIfNotExist(uploadPath); err != nil {
-			http.Error(w, "Error creating upload directory", http.StatusInternalServerError)
-			return
-		}
-
-		// Generate unique file name to avoid conflicts
-		filePath = fmt.Sprintf("%s/%d_%s", uploadPath, time.Now().Unix(), handler.Filename)
-
-		// Save the file
-		dst, err := os.Create(filePath)
-		if err != nil {
-			http.Error(w, "Error saving file", http.StatusInternalServerError)
-			return
-		}
-		defer dst.Close()
-
-		if _, err := io.Copy(dst, file); err != nil {
-			http.Error(w, "Error copying file", http.StatusInternalServerError)
-			return
-		}
-	} else if err != http.ErrMissingFile { // Handle other file-related errors
-		http.Error(w, "Error processing file upload", http.StatusInternalServerError)
+	if err := json.NewDecoder(r.Body).Decode(&updateData); err != nil {
+		http.Error(w, "Invalid JSON input", http.StatusBadRequest)
 		return
 	}
 
@@ -603,16 +542,15 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update fields
-	if fullName != "" {
-		user.FullName = fullName
+	if updateData.FullName != "" {
+		user.FullName = updateData.FullName
 	}
-	if phone != "" {
-		user.Phone = phone
+	if updateData.Phone != "" {
+		user.Phone = updateData.Phone
 	}
-    if filePath != "" {
-        user.ProfilePicturePath = filePath
-        fmt.Println("File path:", filePath) // Debugging line
-    }
+	if updateData.ProfilePictureURL != "" {
+		user.ProfilePicturePath = updateData.ProfilePictureURL
+	}
 
 	// Save updated user data
 	if err := h.db.Save(&user).Error; err != nil {
@@ -740,7 +678,7 @@ var jwtSecretKey = []byte(os.Getenv("SECRET_KEY"))
 func generateJWT(userID uint, expirationMinutes int) (string, error) {
     claims := &jwt.RegisteredClaims{
         Subject:   fmt.Sprint(userID),
-        ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Minute * time.Duration(expirationMinutes))),
+        ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour * time.Duration(expirationMinutes))),
     }
     token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
     return token.SignedString(jwtSecretKey)
@@ -781,20 +719,31 @@ type PasswordResetToken struct {
 }
 
 func (h *Handler) handlePasswordResetRequest(w http.ResponseWriter, r *http.Request) {
-    // Extract user ID from URL parameters
-    vars := mux.Vars(r)
-    userID, err := strconv.ParseUint(vars["userId"], 10, 32)
-    if err != nil {
-        http.Error(w, "Invalid user ID", http.StatusBadRequest)
+    // Parse request body
+    var resetRequest struct {
+        Email string `json:"email"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&resetRequest); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
         return
     }
 
-    // Find user by ID
+    // Validate email
+    if resetRequest.Email == "" {
+        http.Error(w, "Email is required", http.StatusBadRequest)
+        return
+    }
+
+    // Find user by email
     var user models.User
-    result := h.db.First(&user, userID)
+    result := h.db.Where("email = ?", resetRequest.Email).First(&user)
     if result.Error != nil {
-        // Still keeping response vague for security
-        http.Error(w, "If an account exists, a reset link will be sent", http.StatusOK)
+        // Keep response vague for security
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]string{
+            "message": "If an account exists, a reset code will be sent to your email",
+        })
         return
     }
 
@@ -813,7 +762,7 @@ func (h *Handler) handlePasswordResetRequest(w http.ResponseWriter, r *http.Requ
 
     // Create new reset token
     passwordResetToken := models.PasswordResetToken{
-        UserID:    uint(userID),
+        UserID:    user.ID,
         Token:     resetToken,
         ExpiresAt: time.Now().Add(5 * time.Minute),
     }
@@ -839,7 +788,7 @@ func (h *Handler) handlePasswordResetRequest(w http.ResponseWriter, r *http.Requ
     // Respond to the user
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(map[string]string{
-        "message": "Reset code has been sent to your email",
+        "message": "If an account exists, a reset code will be sent to your email",
     })
 }
 
@@ -910,57 +859,63 @@ func (h *Handler) handlePasswordReset(w http.ResponseWriter, r *http.Request) {
 
 
 type TokenVerificationRequest struct {
-	Email string `json:"email"`
-	Token string `json:"token"`
+    Email string `json:"email"`
+    Token string `json:"token"`
 }
 
 func (h *Handler) handleVerifyResetToken(w http.ResponseWriter, r *http.Request) {
-	var req TokenVerificationRequest
+    var req TokenVerificationRequest
 
-	// Decode the incoming request payload
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
+    // Decode the incoming request payload
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
 
-	// Find the user by email
-	var user models.User
-	if err := h.db.Where("email = ?", req.Email).First(&user).Error; err != nil {
-		// Deliberately vague response to avoid revealing user existence
-		http.Error(w, "Invalid email or token", http.StatusBadRequest)
-		return
-	}
+    // Find the user by email
+    var user models.User
+    if err := h.db.Where("email = ?", req.Email).First(&user).Error; err != nil {
+        // Deliberately vague response to avoid revealing user existence
+        http.Error(w, "Invalid email or token", http.StatusBadRequest)
+        return
+    }
 
-	// Find the reset token for the user
-	var resetToken models.PasswordResetToken
-	if err := h.db.Where("user_id = ? AND token = ?", user.ID, req.Token).First(&resetToken).Error; err != nil {
-		http.Error(w, "Invalid email or token", http.StatusBadRequest)
-		return
-	}
+    // Find the reset token for the user
+    var resetToken models.PasswordResetToken
+    if err := h.db.Where("user_id = ? AND token = ?", user.ID, req.Token).First(&resetToken).Error; err != nil {
+        http.Error(w, "Invalid email or token", http.StatusBadRequest)
+        return
+    }
 
-	// Check if the token is expired
-	if time.Now().After(resetToken.ExpiresAt) {
-		http.Error(w, "Token expired", http.StatusBadRequest)
-		return
-	}
+    // Check if the token is expired
+    if time.Now().After(resetToken.ExpiresAt) {
+        http.Error(w, "Token expired", http.StatusBadRequest)
+        return
+    }
 
-	// Token is valid; respond with success
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"message": "Token is valid",
-	})
+    // Token is valid; respond with success and include user ID
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "message": "Token is valid",
+        "user_id": user.ID,
+    })
 }
 
 
 
 func (h *Handler) GetExperts(w http.ResponseWriter, r *http.Request) {
+    if h.db == nil {
+        http.Error(w, "Database connection not initialized", http.StatusInternalServerError)
+        return
+    }
+
     // Parse query parameters
     verified := r.URL.Query().Get("verified")
-    page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-    if page < 1 {
+    page, err := strconv.Atoi(r.URL.Query().Get("page"))
+    if err != nil || page < 1 {
         page = 1
     }
-    pageSize := 10
+    pageSize := 20
 
     // Base query with both User and CertificationFiles preloaded
     query := h.db.Model(&models.Expert{}).
@@ -969,25 +924,76 @@ func (h *Handler) GetExperts(w http.ResponseWriter, r *http.Request) {
 
     // Filter by verification status if specified
     if verified != "" {
-        isVerified, _ := strconv.ParseBool(verified)
+        isVerified, parseErr := strconv.ParseBool(verified)
+        if parseErr != nil {
+            http.Error(w, "Invalid value for 'verified'", http.StatusBadRequest)
+            return
+        }
         query = query.Where("verified = ?", isVerified)
     }
 
-    // Pagination
+    // Count total records
     var total int64
-    query.Count(&total)
-    
+    if err := query.Count(&total).Error; err != nil {
+        http.Error(w, "Error counting experts", http.StatusInternalServerError)
+        return
+    }
+
+    // Fetch paginated experts
     var experts []models.Expert
     result := query.Offset((page - 1) * pageSize).Limit(pageSize).Find(&experts)
-    
     if result.Error != nil {
         http.Error(w, "Error retrieving experts", http.StatusInternalServerError)
         return
     }
 
+    // Check if there are no experts
+    if len(experts) == 0 {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "experts":     []interface{}{},
+            "total":      0,
+            "page":       page,
+            "page_size":  pageSize,
+            "total_pages": 0,
+        })
+        return
+    }
+
+    // Construct response
+    response := make([]map[string]interface{}, 0, len(experts))
+    for _, expert := range experts {
+        if expert.User == nil {
+            continue // Skip if User is nil
+        }
+
+        expertData := map[string]interface{}{
+            "ID":                expert.ID,
+            "CreatedAt":         expert.CreatedAt,
+            "UpdatedAt":         expert.UpdatedAt,
+            "UserID":           expert.UserID,
+            "Expertise":        expert.Expertise,
+            "Bio":              expert.Bio,
+            "Verified":         expert.Verified,
+            "CertificationFiles": expert.CertificationFiles,
+            "User": map[string]interface{}{
+                "FullName":           expert.User.FullName,
+                "Email":             expert.User.Email,
+                "Phone":             expert.User.Phone,
+                "Role":              expert.User.Role,
+                "PhoneVerified":     expert.User.PhoneVerified,
+                "EmailVerified":     expert.User.EmailVerified,
+                "Status":            expert.User.Status,
+                "ProfilePicturePath": expert.User.ProfilePicturePath,
+            },
+        }
+        response = append(response, expertData)
+    }
+
+    // Return the response
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(map[string]interface{}{
-        "experts":     experts,
+        "experts":     response,
         "total":       total,
         "page":        page,
         "page_size":   pageSize,
@@ -997,8 +1003,18 @@ func (h *Handler) GetExperts(w http.ResponseWriter, r *http.Request) {
 
 // GetExpert retrieves a specific expert by ID with full details
 func (h *Handler) GetExpert(w http.ResponseWriter, r *http.Request) {
+    if h.db == nil {
+        http.Error(w, "Database connection not initialized", http.StatusInternalServerError)
+        return
+    }
+
     // Parse expert ID from URL
     vars := mux.Vars(r)
+    if vars == nil {
+        http.Error(w, "Missing URL parameters", http.StatusBadRequest)
+        return
+    }
+
     expertID, err := strconv.ParseUint(vars["id"], 10, 64)
     if err != nil {
         http.Error(w, "Invalid expert ID", http.StatusBadRequest)
@@ -1009,13 +1025,47 @@ func (h *Handler) GetExpert(w http.ResponseWriter, r *http.Request) {
     result := h.db.Preload("User").
         Preload("CertificationFiles").
         First(&expert, expertID)
+
     if result.Error != nil {
-        http.Error(w, "Expert not found", http.StatusNotFound)
+        if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+            http.Error(w, "Expert not found", http.StatusNotFound)
+        } else {
+            http.Error(w, "Error retrieving expert", http.StatusInternalServerError)
+        }
         return
     }
 
+    // Check if User is nil before accessing
+    if expert.User == nil {
+        http.Error(w, "Expert user data not found", http.StatusInternalServerError)
+        return
+    }
+
+    // Construct response including both expert and user data
+    expertData := map[string]interface{}{
+        "ID":                expert.ID,
+        "CreatedAt":         expert.CreatedAt,
+        "UpdatedAt":         expert.UpdatedAt,
+        "UserID":           expert.UserID,
+        "Expertise":        expert.Expertise,
+        "Bio":              expert.Bio,
+        "Verified":         expert.Verified,
+        "CertificationFiles": expert.CertificationFiles,
+        "User": map[string]interface{}{
+            "FullName":           expert.User.FullName,
+            "Email":             expert.User.Email,
+            "Phone":             expert.User.Phone,
+            "Role":              expert.User.Role,
+            "PhoneVerified":     expert.User.PhoneVerified,
+            "EmailVerified":     expert.User.EmailVerified,
+            "Status":            expert.User.Status,
+            "ProfilePicturePath": expert.User.ProfilePicturePath,
+        },
+    }
+
+    // Return the response
     w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(expert)
+    json.NewEncoder(w).Encode(expertData)
 }
 
 // UpdateExpert allows updating expert profile information

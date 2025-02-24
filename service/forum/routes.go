@@ -29,8 +29,8 @@ func (h *PostHandler) RegisterRoutes(router *mux.Router) {
     router.HandleFunc("/posts/{id}", h.DeletePost).Methods("DELETE")
     
     // Like routes
-    router.HandleFunc("/posts/{id}/like", h.LikePost).Methods("POST")
-    router.HandleFunc("/posts/{id}/unlike", h.UnlikePost).Methods("POST")
+    router.HandleFunc("/posts/{id}/like", utils.AuthMiddleware(h.LikePost)).Methods("POST")
+    router.HandleFunc("/posts/{id}/unlike", utils.AuthMiddleware(h.UnlikePost)).Methods("POST")
     
     // Comment routes
     router.HandleFunc("/posts/{id}/comments", utils.AuthMiddleware(h.AddComment)).Methods("POST")
@@ -45,29 +45,36 @@ func (h *PostHandler) RegisterRoutes(router *mux.Router) {
 
 // CreatePost creates a new post
 func (h *PostHandler) CreatePost(w http.ResponseWriter, r *http.Request) {
+    // Step 1: Get the user ID from the request context
     userID, err := utils.GetUserIDFromContext(r.Context())
     if err != nil {
         http.Error(w, "Unauthorized", http.StatusUnauthorized)
         return
     }
 
-    err = r.ParseMultipartForm(50 << 20)
-    if err != nil {
-        http.Error(w, "Error parsing form", http.StatusBadRequest)
+    // Step 2: Parse the JSON request body
+    var request struct {
+        Content string   `json:"content"`
+        Images  []string `json:"images"` // Array of image URLs
+    }
+    if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+        http.Error(w, "Invalid JSON", http.StatusBadRequest)
         return
     }
 
-    content := r.FormValue("content")
-    if content == "" {
+    // Step 3: Validate content
+    if request.Content == "" {
         http.Error(w, "Content is required", http.StatusBadRequest)
         return
     }
 
+    // Step 4: Begin a new transaction
     tx := h.db.Begin()
 
+    // Step 5: Create the post record
     post := models.Post{
         UserID:  userID,
-        Content: content,
+        Content: request.Content,
     }
 
     if err := tx.Create(&post).Error; err != nil {
@@ -76,49 +83,37 @@ func (h *PostHandler) CreatePost(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Handle multiple image uploads
-    files := r.MultipartForm.File["images"]
-    for i, fileHeader := range files {
-        file, err := fileHeader.Open()
-        if err != nil {
-            tx.Rollback()
-            http.Error(w, "Error processing image", http.StatusInternalServerError)
-            return
-        }
-        defer file.Close()
-
-        imageURL, err := utils.SaveImage(file, fileHeader)
-        if err != nil {
-            tx.Rollback()
-            http.Error(w, fmt.Sprintf("Error saving image: %v", err), http.StatusInternalServerError)
-            return
-        }
+    // Step 6: Handle image URLs
+    for i, imageURL := range request.Images {
+        // You can perform additional validation on the URLs if needed
 
         image := models.Image{
-            PostID:  post.ID,
-            URL:     imageURL,
+            PostID: post.ID,
+            URL:    imageURL,
+            // Optional: You can handle image captions here if provided in the request
             Caption: r.FormValue(fmt.Sprintf("caption_%d", i)),
         }
 
         if err := tx.Create(&image).Error; err != nil {
             tx.Rollback()
-            // Clean up saved image
-            utils.DeleteImage(imageURL)
             http.Error(w, "Error saving image record", http.StatusInternalServerError)
             return
         }
     }
 
+    // Step 7: Commit the transaction
     if err := tx.Commit().Error; err != nil {
         http.Error(w, "Error saving post", http.StatusInternalServerError)
         return
     }
 
+    // Step 8: Preload related data and send response
     h.db.Preload("User").Preload("Images").Preload("Likes").Preload("Comments").First(&post, post.ID)
 
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(post)
 }
+
 
 // GetPosts retrieves all posts with pagination
 func (h *PostHandler) GetPosts(w http.ResponseWriter, r *http.Request) {
@@ -126,12 +121,19 @@ func (h *PostHandler) GetPosts(w http.ResponseWriter, r *http.Request) {
     if page < 1 {
         page = 1
     }
-    pageSize := 10
+    // Get page size from query params with validation
+    pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+    if pageSize < 1 {
+        pageSize = 15 // default size
+    }
+    if pageSize > 100 { // set a reasonable maximum
+        pageSize = 100
+    }
 
     var posts []models.Post
     var total int64
 
-    query := h.db.Model(&models.Post{}).Preload("User").Preload("Likes").Preload("Comments").Preload("Images")
+    query := h.db.Model(&models.Post{}).Preload("User").Preload("Likes").Preload("Comments").Preload("Images").Order("created_at DESC")
     query.Count(&total)
 
     if err := query.Offset((page - 1) * pageSize).Limit(pageSize).Find(&posts).Error; err != nil {
@@ -158,8 +160,11 @@ func (h *PostHandler) LikePost(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // TODO: Get user ID from JWT token
-    userID := uint(1) // Replace with actual user ID from token
+    userID, err := utils.GetUserIDFromContext(r.Context())
+    if err != nil {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
 
     // Start transaction
     tx := h.db.Begin()
@@ -411,8 +416,11 @@ func (h *PostHandler) UnlikePost(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // TODO: Get user ID from JWT token
-    userID := uint(1) // Replace with actual user ID from token
+    userID, err := utils.GetUserIDFromContext(r.Context())
+    if err != nil {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
 
     tx := h.db.Begin()
 

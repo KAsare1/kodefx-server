@@ -70,6 +70,9 @@ func performMigrations(DB *gorm.DB) error {
         &models.Channel{}:           "Channel",
 		&models.ChannelMessage{}:    "ChannelMessage",
 		&models.Client{}:            "Client",
+        &models.Signal{}:            "Signal",
+        &models.Transaction{}:       "Transaction",
+        &models.SignalSubscription{}: "SignalSubscription",
 	}
 
 	log.Println("Starting database migrations...")
@@ -164,7 +167,11 @@ func clearDatabase(DB *gorm.DB, tables []interface{}) error {
 
             &models.Channel{},           
             &models.ChannelMessage{},  
-            &models.Client{},     
+            &models.Client{},
+            
+            &models.Signal{},
+            &models.Transaction{},
+            &models.SignalSubscription{},
         }
     }
 
@@ -244,6 +251,12 @@ func runDatabaseClear() {
                 tables = append(tables, &models.ChannelMessage{})
             case "Client":
                 tables = append(tables, &models.Client{})
+            case "Signal":
+                tables = append(tables, &models.Signal{})
+            case "Transaction":
+                tables = append(tables, &models.Transaction{})
+            case "SignalSubscription":
+                tables = append(tables, &models.SignalSubscription{})
             default:
                 log.Printf("Unknown table: %s", table)
             }

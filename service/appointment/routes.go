@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/KAsare1/Kodefx-server/cmd/models"
@@ -477,6 +478,8 @@ func (h *AppointmentHandler) InitializeAppointmentPayment(w http.ResponseWriter,
     })
 }
 
+
+//TODO: SEPERATE THE TWO ENDPOINTS FOR RECEIVEING WEBHOOKS OR JUST MOVE THIS TO A SEPERATE FOLDER/PACKAGE
 // HandlePaystackWebhook processes the payment webhook from Paystack
 func (h *AppointmentHandler) HandlePaystackWebhook(w http.ResponseWriter, r *http.Request) {
     // Verify Paystack webhook signature
@@ -499,9 +502,17 @@ func (h *AppointmentHandler) HandlePaystackWebhook(w http.ResponseWriter, r *htt
     var webhookPayload struct {
         Event string `json:"event"`
         Data  struct {
-            Reference  string `json:"reference"`
-            Status    string `json:"status"`
+            Reference string  `json:"reference"`
+            Status    string  `json:"status"`
             Amount    float64 `json:"amount"`
+            Metadata  struct {
+                PaymentType    string `json:"payment_type"`
+                AppointmentID  uint   `json:"appointment_id,omitempty"`
+                UserID         uint   `json:"user_id,omitempty"`
+                TraderID       uint   `json:"trader_id,omitempty"`
+                ExpertID       uint   `json:"expert_id,omitempty"`
+                SignalPlan     string `json:"signal_plan,omitempty"`
+            } `json:"metadata"`
         } `json:"data"`
     }
 
@@ -518,20 +529,118 @@ func (h *AppointmentHandler) HandlePaystackWebhook(w http.ResponseWriter, r *htt
 
     tx := h.db.Begin()
 
-    // Find and update appointment
-    var appointment models.Appointment
-    if err := tx.Where("payment_id = ?", webhookPayload.Data.Reference).First(&appointment).Error; err != nil {
-        tx.Rollback()
-        http.Error(w, "Appointment not found", http.StatusNotFound)
-        return
+    // Determine payment type from the reference or metadata
+    paymentType := ""
+    if strings.HasPrefix(webhookPayload.Data.Reference, "APT-") {
+        paymentType = "appointment"
+    } else if strings.HasPrefix(webhookPayload.Data.Reference, "SIG-") {
+        paymentType = "signal_subscription"
+    } else if webhookPayload.Data.Metadata.PaymentType != "" {
+        paymentType = webhookPayload.Data.Metadata.PaymentType
     }
 
-    // Update appointment status
-    appointment.PaymentStatus = "paid"
-    appointment.Status = "Confirmed"
-    if err := tx.Save(&appointment).Error; err != nil {
+    // Process different payment types
+    switch paymentType {
+    case "appointment":
+        // Find and update appointment
+        var appointment models.Appointment
+        if err := tx.Where("payment_id = ?", webhookPayload.Data.Reference).First(&appointment).Error; err != nil {
+            tx.Rollback()
+            http.Error(w, "Appointment not found", http.StatusNotFound)
+            return
+        }
+
+        // Update appointment status
+        appointment.PaymentStatus = "paid"
+        appointment.Status = "Confirmed"
+        if err := tx.Save(&appointment).Error; err != nil {
+            tx.Rollback()
+            http.Error(w, "Error updating appointment", http.StatusInternalServerError)
+            return
+        }
+
+        // Create a new transaction record
+        transaction := models.Transaction{
+            UserID:  appointment.TraderID,
+            Amount:  webhookPayload.Data.Amount / 100, 
+            Method:  "Paystack", 
+            Purpose: "Appointment", 
+        }
+
+        if err := tx.Create(&transaction).Error; err != nil {
+            tx.Rollback()
+            http.Error(w, "Error creating transaction", http.StatusInternalServerError)
+            return
+        }
+
+    case "signal_subscription":
+        // Get user ID from metadata or parse from reference if needed
+        userID := webhookPayload.Data.Metadata.UserID
+        
+        // If userID is 0, try to extract from reference (SIG-123-timestamp)
+        if userID == 0 && strings.HasPrefix(webhookPayload.Data.Reference, "SIG-") {
+            parts := strings.Split(webhookPayload.Data.Reference, "-")
+            if len(parts) > 1 {
+                extractedID, err := strconv.ParseUint(parts[1], 10, 32)
+                if err == nil {
+                    userID = uint(extractedID)
+                }
+            }
+        }
+        
+        // Find and update subscription
+        var subscription models.SignalSubscription
+        if err := tx.Where("payment_id = ?", webhookPayload.Data.Reference).First(&subscription).Error; err != nil {
+            tx.Rollback()
+            http.Error(w, "Subscription not found", http.StatusNotFound)
+            return
+        }
+
+        // Calculate subscription duration based on plan
+        now := time.Now()
+        var endDate time.Time
+        
+        switch subscription.Plan {
+        case "monthly":
+            endDate = now.AddDate(0, 1, 0)
+        case "quarterly":
+            endDate = now.AddDate(0, 3, 0)
+        case "annual":
+            endDate = now.AddDate(1, 0, 0)
+        default:
+            endDate = now.AddDate(0, 1, 0) // Default to monthly
+        }
+
+        // Update subscription status
+        subscription.Status = "active"
+        subscription.StartDate = now
+        subscription.EndDate = endDate
+        
+        if err := tx.Save(&subscription).Error; err != nil {
+            tx.Rollback()
+            http.Error(w, "Error updating subscription", http.StatusInternalServerError)
+            return
+        }
+
+        // Create a new transaction record
+        transaction := models.Transaction{
+            UserID:  userID,
+            Amount:  webhookPayload.Data.Amount / 100, // Convert from smallest unit
+            Method:  "Paystack", 
+            Purpose: "Signal Subscription - " + subscription.Plan, 
+        }
+
+        if err := tx.Create(&transaction).Error; err != nil {
+            tx.Rollback()
+            http.Error(w, "Error creating transaction", http.StatusInternalServerError)
+            return
+        }
+        
+    default:
+        // Unknown payment type
         tx.Rollback()
-        http.Error(w, "Error updating appointment", http.StatusInternalServerError)
+        log.Printf("Unknown payment type for reference: %s", webhookPayload.Data.Reference)
+        w.WriteHeader(http.StatusOK) // Still return 200 to avoid repeated webhooks
         return
     }
 

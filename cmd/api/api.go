@@ -6,6 +6,7 @@ import (
 
 	"github.com/KAsare1/Kodefx-server/service/appointment"
 	"github.com/KAsare1/Kodefx-server/service/availability"
+	"github.com/KAsare1/Kodefx-server/service/dashboard"
 	"github.com/KAsare1/Kodefx-server/service/forum"
 	"github.com/KAsare1/Kodefx-server/service/signals"
 	"github.com/KAsare1/Kodefx-server/service/subscription"
@@ -56,6 +57,9 @@ func (s *APIServer) Run() error {
 
 	transHandler := transactions.NewTransactionHandler(s.db)
 	transHandler.RegisterRoutes(subrouter)
+
+	dashboardHandler := dashboard.NewDashboardHandler(s.db)
+	dashboardHandler.RegisterRoutes(subrouter)
 
 	// CORS configuration to allow all origins
 	corsMiddleware := handlers.CORS(

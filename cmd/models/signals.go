@@ -15,6 +15,7 @@ type Signal struct {
 	TakeProfits pq.Float64Array `gorm:"type:float[];column:take_profits" json:"take_profits,omitempty"`
 
     Commentary   string    `gorm:"column:commentary;type:text" json:"commentary,omitempty"`
+    Outcome      string    `gorm:"column:outcome;type:text" json:"outcome,omitempty"`
 
     User         User      `gorm:"foreignKey:UserID" json:"user,omitempty"`
 }

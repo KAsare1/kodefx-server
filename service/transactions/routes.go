@@ -75,6 +75,7 @@ type PaystackResponse struct {
 
 // SimplifiedTransaction is your custom transaction format
 type SimplifiedTransaction struct {
+	ID 	  uint    `json:"id"`
 	Amount  string `json:"amount"`
 	Method  string `json:"method"`
 	Purpose string `json:"purpose"`
@@ -341,6 +342,7 @@ func (h *TransactionHandler) GetPaystackTransactions(w http.ResponseWriter, r *h
 		
 		// Create simplified transaction
 		simplifiedTransaction := SimplifiedTransaction{
+			ID: 	uint(transaction.ID),
 			Amount:  amount,
 			Method:  transaction.Channel,
 			Purpose: purpose,

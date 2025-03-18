@@ -41,7 +41,7 @@ func (h *DashboardHandler) GetDashboardStats(w http.ResponseWriter, r *http.Requ
 	stats.TotalTraders = tradersCount
 
 	// Count Experts
-	h.db.Model(&models.Expert{}).Count(&expertsCount)
+	h.db.Model(&models.User{}).Where("role = ?", "expert").Count(&expertsCount)
 	stats.TotalExperts = expertsCount
 
 	// Fetch Total Income from Paystack

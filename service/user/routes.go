@@ -469,37 +469,112 @@ func (h *Handler) verifyUser(w http.ResponseWriter, r *http.Request) {
 
 
 // GetUsers retrieves all users
+// GetUsers retrieves all users with their subscription status
 func (h *Handler) GetUsers(w http.ResponseWriter, r *http.Request) {
-	var users []models.User
-	result := h.db.Find(&users)
-	if result.Error != nil {
-		http.Error(w, "Error retrieving users", http.StatusInternalServerError)
-		return
-	}
+    var users []models.User
+    result := h.db.Preload("Expert").Find(&users)
+    if result.Error != nil {
+        http.Error(w, "Error retrieving users", http.StatusInternalServerError)
+        return
+    }
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(users)
+    type UserWithSubscription struct {
+        models.User
+        SubscriptionStatus string `json:"subscription_status"`
+        Plan string `json:"plan,omitempty"`
+    }
+
+    var usersWithSubs []UserWithSubscription
+    
+    for _, user := range users {
+        userWithSub := UserWithSubscription{
+            User: user,
+            SubscriptionStatus: "none",
+        }
+        
+        // Check for active subscription
+        var subscription models.SignalSubscription
+        subResult := h.db.Where("user_id = ? AND status = ? AND end_date > ?", user.ID, "active", time.Now()).
+            First(&subscription)
+        
+        if subResult.Error == nil {
+            userWithSub.SubscriptionStatus = "active"
+            userWithSub.Plan = subscription.Plan
+        } else {
+            // Check for expired subscription
+            expiredResult := h.db.Where("user_id = ?", user.ID).
+                Order("end_date DESC").
+                First(&subscription)
+            
+            if expiredResult.Error == nil {
+                userWithSub.SubscriptionStatus = "expired"
+                userWithSub.Plan = subscription.Plan
+            }
+        }
+        
+        usersWithSubs = append(usersWithSubs, userWithSub)
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(usersWithSubs)
 }
 
 // GetUser retrieves a specific user by ID
 func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
-	// Parse user ID from URL
-	vars := mux.Vars(r)
-	userID, err := strconv.ParseUint(vars["id"], 10, 64)
-	if err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
-	}
+    // Parse user ID from URL
+    vars := mux.Vars(r)
+    userID, err := strconv.ParseUint(vars["id"], 10, 64)
+    if err != nil {
+        http.Error(w, "Invalid user ID", http.StatusBadRequest)
+        return
+    }
 
-	var user models.User
-	result := h.db.Preload("Expert").First(&user, userID).Preload("ProfilePicturePath")
-	if result.Error != nil {
-		http.Error(w, "User not found", http.StatusNotFound)
-		return
-	}
+    var user models.User
+    result := h.db.Preload("Expert").Preload("Expert.CertificationFiles").First(&user, userID)
+    if result.Error != nil {
+        http.Error(w, "User not found", http.StatusNotFound)
+        return
+    }
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(user)
+    // Create a response structure that includes subscription info
+    type UserResponse struct {
+        models.User
+        Subscription *models.SignalSubscription `json:"subscription"`
+        SubscriptionStatus string `json:"subscription_status"`
+    }
+
+    // Prepare the response
+    response := UserResponse{
+        User: user,
+        Subscription: nil,
+        SubscriptionStatus: "none",
+    }
+
+    // Find active subscription for the user
+    var subscription models.SignalSubscription
+    subResult := h.db.Where("user_id = ? AND status = ? AND end_date > ?", userID, "active", time.Now()).
+        Order("end_date DESC").
+        First(&subscription)
+    
+    if subResult.Error == nil {
+        // User has an active subscription
+        response.Subscription = &subscription
+        response.SubscriptionStatus = "active"
+    } else if subResult.Error == gorm.ErrRecordNotFound {
+        // Check if user had a subscription that expired
+        var expiredSub models.SignalSubscription
+        expiredResult := h.db.Where("user_id = ?", userID).
+            Order("end_date DESC").
+            First(&expiredSub)
+        
+        if expiredResult.Error == nil {
+            response.Subscription = &expiredSub
+            response.SubscriptionStatus = "expired"
+        }
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(response)
 }
 
 

@@ -53,7 +53,7 @@ func (h *Handler) RegisterRoutes(router *mux.Router) {
 	router.HandleFunc("/experts", h.GetExperts).Methods("GET")
 	router.HandleFunc("/experts/{id}", h.GetExpert).Methods("GET")
 	router.HandleFunc("/experts/{id}", h.UpdateExpert).Methods("PUT")
-	router.HandleFunc("/experts/verify/{id}", h.VerifyExpert).Methods("POST")
+	router.HandleFunc("/experts/{id}/verify", h.VerifyExpert).Methods("PATCH")
 	router.HandleFunc("/experts/search", h.SearchExperts).Methods("GET")
 	router.HandleFunc("/experts/expertise/{expertise}", h.GetExpertsByExpertise).Methods("GET")
     router.HandleFunc("/images/{filename}", h.ServeImage).Methods("GET")
@@ -1148,15 +1148,6 @@ func (h *Handler) VerifyExpert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse verification request
-	var verifyRequest struct {
-		Verified bool `json:"verified"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&verifyRequest); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
 	// Find expert
 	var expert models.Expert
 	result := h.db.First(&expert, expertID)
@@ -1165,19 +1156,32 @@ func (h *Handler) VerifyExpert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if already verified
+	if expert.Verified {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"message":  "Expert is already verified",
+			"verified": true,
+		})
+		return
+	}
+
 	// Update verification status
-	expert.Verified = verifyRequest.Verified
+	expert.Verified = true
 	if err := h.db.Save(&expert).Error; err != nil {
 		http.Error(w, "Error updating expert verification", http.StatusInternalServerError)
 		return
 	}
 
+	// Return success response
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":   "Expert verification updated",
-		"verified": expert.Verified,
+		"message":  "Expert successfully verified",
+		"verified": true,
 	})
 }
+
+
 
 // SearchExperts allows searching experts by various criteria
 func (h *Handler) SearchExperts(w http.ResponseWriter, r *http.Request) {

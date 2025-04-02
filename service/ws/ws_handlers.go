@@ -36,11 +36,12 @@ func NewChatHandler(db *gorm.DB) *ChatHandler {
 }
 
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true 
-	},
+    ReadBufferSize:  1024,
+    WriteBufferSize: 1024,
+    HandshakeTimeout: 10 * time.Second, // Add a reasonable timeout
+    CheckOrigin: func(r *http.Request) bool {
+        return true 
+    },
 }
 
 func (h *ChatHandler) RegisterRoutes(router *mux.Router, ) {
@@ -67,13 +68,17 @@ func (h *ChatHandler) RegisterRoutes(router *mux.Router, ) {
 func (h *ChatHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
     log.Println("WebSocket connection request received")
 
-	vars := mux.Vars(r)
-	UserID, err := strconv.ParseUint(vars["id"], 10, 64)
-	if err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
-	}
+    vars := mux.Vars(r)
+    UserID, err := strconv.ParseUint(vars["id"], 10, 64)
+    if err != nil {
+        http.Error(w, "Invalid user ID", http.StatusBadRequest)
+        return
+    }
 
+    // Set a reasonable timeout for the WebSocket upgrade
+    upgrader.HandshakeTimeout = 5 * time.Second
+
+    // Establish the connection first, before doing any database operations
     conn, err := upgrader.Upgrade(w, r, nil)
     if err != nil {
         log.Printf("WebSocket upgrade failed: %v\n", err)
@@ -82,6 +87,7 @@ func (h *ChatHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
     log.Printf("WebSocket connection established for user %d\n", UserID)
 
+    // Create the client
     client := &models.ClientConnection{
         Hub:    h.hub,
         Conn:   conn,
@@ -89,21 +95,46 @@ func (h *ChatHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
         UserID: uint(UserID),
     }
 
-    // Subscribe to all channels the user is a member of
-    var channels []models.Channel
-    if err := h.db.Joins("JOIN channel_clients ON channels.id = channel_clients.channel_id").
-        Joins("JOIN clients ON channel_clients.client_id = clients.id").
-        Where("clients.user_id = ?", UserID).
-        Find(&channels).Error; err == nil {
+    // Register the client immediately to establish connection quickly
+    h.hub.Register <- client
+
+    // Start the write pump to handle sending messages to the client
+    go client.WritePump()
+    
+    // Start the read pump to handle incoming messages from the client
+    go h.handleClientMessages(client)
+
+    // Asynchronously load and subscribe to channels after connection is established
+    go func() {
+        var channels []models.Channel
+        
+        err := h.db.Joins("JOIN channel_clients ON channels.id = channel_clients.channel_id").
+            Joins("JOIN clients ON channel_clients.client_id = clients.id").
+            Where("clients.user_id = ?", UserID).
+            Find(&channels).Error
+            
+        if err != nil {
+            log.Printf("Error loading channels for user %d: %v\n", UserID, err)
+            return
+        }
+        
+        log.Printf("Subscribing user %d to %d channels\n", UserID, len(channels))
+        
         for _, channel := range channels {
             h.hub.SubscribeToChannel(channel.ID, client)
         }
-    }
-
-    h.hub.Register <- client
-
-    go client.WritePump()
-    go h.handleClientMessages(client)
+        
+        // Send a confirmation message to the client
+        confirmMsg := models.WebSocketMessage{
+            Type: "connection_established",
+            PeerMsg: nil,
+            ChannelMsg: nil,
+        }
+        
+        if msgBytes, err := json.Marshal(confirmMsg); err == nil {
+            client.Send <- msgBytes
+        }
+    }()
 }
 
 

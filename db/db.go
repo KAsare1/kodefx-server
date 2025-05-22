@@ -32,10 +32,10 @@ func NewPSQLStorage() (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	sqlDB.SetMaxOpenConns(50)                 // Maximum number of open connections
-	sqlDB.SetMaxIdleConns(25)                 // Maximum number of idle connections
-	sqlDB.SetConnMaxLifetime(30 * time.Minute) // Maximum lifetime of a connection
-	sqlDB.SetConnMaxIdleTime(10 * time.Minute) // Maximum idle time of a connection
+	sqlDB.SetMaxOpenConns(50)                 
+	sqlDB.SetMaxIdleConns(25)                 
+	sqlDB.SetConnMaxLifetime(30 * time.Minute)
+	sqlDB.SetConnMaxIdleTime(10 * time.Minute)
 
 	return db, nil
 }

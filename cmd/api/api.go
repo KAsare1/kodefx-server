@@ -11,6 +11,7 @@ import (
 	"github.com/KAsare1/Kodefx-server/service/signals"
 	"github.com/KAsare1/Kodefx-server/service/subscription"
 	"github.com/KAsare1/Kodefx-server/service/transactions"
+	"github.com/KAsare1/Kodefx-server/service/notifications"
 	"github.com/KAsare1/Kodefx-server/service/user"
 	service "github.com/KAsare1/Kodefx-server/service/ws"
 	"github.com/gorilla/handlers"
@@ -60,6 +61,9 @@ func (s *APIServer) Run() error {
 
 	dashboardHandler := dashboard.NewDashboardHandler(s.db)
 	dashboardHandler.RegisterRoutes(subrouter)
+
+	notificationHandler := notification.NewNotificationHandler(s.db)
+	notificationHandler.RegisterRoutes(subrouter)
 
 	// CORS configuration to allow all origins
 	corsMiddleware := handlers.CORS(

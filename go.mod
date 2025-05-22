@@ -42,4 +42,15 @@ require (
 	golang.org/x/crypto v0.31.0
 )
 
-require github.com/felixge/httpsnoop v1.0.3 // indirect
+require (
+	github.com/ably/ably-go v1.2.22 // indirect
+	github.com/felixge/httpsnoop v1.0.3 // indirect
+	github.com/gofrs/uuid v4.0.0+incompatible // indirect
+	github.com/gomodule/redigo v1.8.4 // indirect
+	github.com/googollee/go-socket.io v1.7.0 // indirect
+	github.com/klauspost/compress v1.10.3 // indirect
+	github.com/oliveroneill/exponent-server-sdk-golang v0.0.0-20210823140141-d050598be512 // indirect
+	github.com/ugorji/go/codec v1.1.9 // indirect
+	golang.org/x/sys v0.28.0 // indirect
+	nhooyr.io/websocket v1.8.7 // indirect
+)

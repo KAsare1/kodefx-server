@@ -73,6 +73,11 @@ func performMigrations(DB *gorm.DB) error {
         &models.Signal{}:            "Signal",
         &models.Transaction{}:       "Transaction",
         &models.SignalSubscription{}: "SignalSubscription",
+        &models.Device{}: "Device",
+        // &models.NotificationRequest{}: "NotificationRequest",
+        // &models.BroadcastRequest{}: "BroadcastRequest",
+        &models.NotificationHistory{}: "NotificationHistory ",
+        &models.Rating{}: "Rating",
 	}
 
 	log.Println("Starting database migrations...")
@@ -172,6 +177,13 @@ func clearDatabase(DB *gorm.DB, tables []interface{}) error {
             &models.Signal{},
             &models.Transaction{},
             &models.SignalSubscription{},
+
+            &models.Device{},
+            // &models.NotificationRequest{},
+            // &models.BroadcastRequest{},
+            &models.NotificationHistory{},
+            &models.Rating{},
+
         }
     }
 

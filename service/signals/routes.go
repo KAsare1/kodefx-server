@@ -14,15 +14,36 @@ import (
 	"github.com/KAsare1/Kodefx-server/cmd/models"
 	"github.com/KAsare1/Kodefx-server/cmd/utils"
 	"github.com/gorilla/mux"
+	expo "github.com/oliveroneill/exponent-server-sdk-golang/sdk"
 	"gorm.io/gorm"
 )
 
-type SignalHandler struct {
-	db *gorm.DB
+type NotificationSender interface {
+	SendUserNotification(userID string, title, body string, data map[string]interface{}) (bool, error)
+	BroadcastNotification(title, body string, data map[string]interface{}, userIDs []string) (bool, error)
 }
 
+// DefaultNotificationSender implements the NotificationSender interface
+type DefaultNotificationSender struct {
+	db         *gorm.DB
+	expoClient *expo.PushClient
+}
+
+// Add notificationSender field to SignalHandler
+type SignalHandler struct {
+	db                 *gorm.DB
+	notificationSender NotificationSender
+}
+
+// Update the NewSignalHandler function to initialize with NotificationSender
 func NewSignalHandler(db *gorm.DB) *SignalHandler {
-	return &SignalHandler{db: db}
+	return &SignalHandler{
+		db: db,
+		notificationSender: &DefaultNotificationSender{
+			db:         db,
+			expoClient: expo.NewPushClient(nil),
+		},
+	}
 }
 
 type PaginatedResponse struct {
@@ -69,6 +90,188 @@ func ParsePaginationParams(r *http.Request) (int, int, error) {
 	return page, perPage, nil
 }
 
+func (s *DefaultNotificationSender) SendUserNotification(userID string, title, body string, data map[string]interface{}) (bool, error) {
+	// Get user's devices
+	var devices []models.Device
+	result := s.db.Where("user_id = ?", userID).Find(&devices)
+
+	if result.Error != nil {
+		return false, fmt.Errorf("error retrieving user devices: %v", result.Error)
+	}
+
+	if len(devices) == 0 {
+		return true, nil // No devices to notify, but not an error
+	}
+
+	// Collect all tokens for this user
+	var tokens []string
+	for _, device := range devices {
+		tokens = append(tokens, device.Token)
+	}
+
+	// Send notification to all user devices using SDK
+	success, err := s.sendExpoNotificationSDK(tokens, title, body, data)
+
+	// Create notification history
+	status := "sent"
+	if !success || err != nil {
+		status = "failed"
+	}
+
+	// Convert data to JSON string
+	dataJSON, _ := json.Marshal(data)
+
+	history := models.NotificationHistory{
+		UserID: userID,
+		Title:  title,
+		Body:   body,
+		Data:   string(dataJSON),
+		Status: status,
+		SentAt: time.Now(),
+	}
+
+	if dbErr := s.db.Create(&history).Error; dbErr != nil {
+		// Log this error but don't fail the request
+		log.Printf("Error creating notification history: %v", dbErr)
+	}
+
+	return success, err
+}
+
+// BroadcastNotification sends a notification to multiple users or all users
+func (s *DefaultNotificationSender) BroadcastNotification(title, body string, data map[string]interface{}, userIDs []string) (bool, error) {
+	var devices []models.Device
+	query := s.db
+
+	// If specific user IDs are provided, filter by them
+	if len(userIDs) > 0 {
+		query = query.Where("user_id IN ?", userIDs)
+	}
+
+	// Get all devices (or filtered by user IDs)
+	if err := query.Find(&devices).Error; err != nil {
+		return false, fmt.Errorf("error retrieving devices: %v", err)
+	}
+
+	if len(devices) == 0 {
+		return true, nil // No devices to notify, but not an error
+	}
+
+	// Collect all tokens and track users for history
+	var tokens []string
+	userMap := make(map[string]bool)
+	for _, device := range devices {
+		tokens = append(tokens, device.Token)
+		userMap[device.UserID] = true
+	}
+
+	// Send notifications using SDK (it handles batching internally)
+	success, err := s.sendExpoNotificationSDK(tokens, title, body, data)
+
+	// Determine the status based on the success of sending
+	status := "sent"
+	if !success || err != nil {
+		status = "failed"
+	}
+
+	// Convert data to JSON string for storage
+	dataJSON, _ := json.Marshal(data)
+
+	// Create notification history for each user
+	for userID := range userMap {
+		history := models.NotificationHistory{
+			UserID: userID,
+			Title:  title,
+			Body:   body,
+			Data:   string(dataJSON),
+			Status: status,
+			SentAt: time.Now(),
+		}
+
+		if err := s.db.Create(&history).Error; err != nil {
+			// Log this error but don't fail the request
+			log.Printf("Error creating notification history for user %s: %v\n", userID, err)
+		}
+	}
+
+	return success, err
+}
+
+// sendExpoNotificationSDK sends push notifications using the Expo SDK
+func (s *DefaultNotificationSender) sendExpoNotificationSDK(tokenStrings []string, title, body string, data map[string]interface{}) (bool, error) {
+	// Convert string tokens to ExponentPushToken
+	var pushTokens []expo.ExponentPushToken
+	var invalidTokens []string
+	
+	for _, tokenString := range tokenStrings {
+		pushToken, err := expo.NewExponentPushToken(tokenString)
+		if err != nil {
+			log.Printf("Invalid push token format %s: %v", tokenString, err)
+			invalidTokens = append(invalidTokens, tokenString)
+			continue // Skip invalid tokens instead of failing completely
+		}
+		pushTokens = append(pushTokens, pushToken)
+	}
+
+	if len(pushTokens) == 0 {
+		return false, fmt.Errorf("no valid push tokens found")
+	}
+
+	// Convert data to map[string]string as required by the SDK
+	var stringData map[string]string
+	if data != nil {
+		stringData = make(map[string]string)
+		for key, value := range data {
+			// Convert all values to strings
+			stringData[key] = fmt.Sprintf("%v", value)
+		}
+	}
+
+	// Create the push message
+	pushMessage := &expo.PushMessage{
+		To:       pushTokens,
+		Body:     body,
+		Title:    title,
+		Sound:    "default",
+		Priority: expo.DefaultPriority,
+		Data:     stringData,
+	}
+
+	// Send the notification
+	response, err := s.expoClient.Publish(pushMessage)
+	if err != nil {
+		return false, fmt.Errorf("failed to publish notification: %v", err)
+	}
+
+	// Check for any validation errors in the response
+	if validationErr := response.ValidateResponse(); validationErr != nil {
+		log.Printf("Push notification validation error: %v", validationErr)
+		
+		// Clean up invalid tokens from database
+		s.cleanupInvalidTokens(invalidTokens)
+		
+		return false, fmt.Errorf("notification validation failed: %v", validationErr)
+	}
+
+	// Clean up any invalid tokens we found during token conversion
+	if len(invalidTokens) > 0 {
+		s.cleanupInvalidTokens(invalidTokens)
+	}
+
+	return true, nil
+}
+
+// Helper function to remove invalid tokens from database
+func (s *DefaultNotificationSender) cleanupInvalidTokens(tokens []string) {
+	for _, token := range tokens {
+		if err := s.db.Where("token = ?", token).Delete(&models.Device{}).Error; err != nil {
+			log.Printf("Error cleaning up invalid token %s: %v", token, err)
+		} else {
+			log.Printf("Cleaned up invalid token: %s", token)
+		}
+	}
+}
+
 func (h *SignalHandler) RegisterRoutes(router *mux.Router) {
 	signalRouter := router.PathPrefix("/signals").Subrouter()
 
@@ -96,6 +299,7 @@ func (h *SignalHandler) RegisterRoutes(router *mux.Router) {
 	signalRouter.HandleFunc("/payment/initialize", utils.AuthMiddleware(h.InitializeSignalPayment)).Methods("POST")
 }
 
+
 // CreateSignal creates a new signal
 func (h *SignalHandler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	userID, err := utils.GetUserIDFromContext(r.Context())
@@ -119,93 +323,135 @@ func (h *SignalHandler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Send notification to users about the new signal
+	// Get users with active signal subscriptions
+	var subscriberIDs []string
+	h.db.Model(&models.SignalSubscription{}).
+		Where("status = ? AND NOW() BETWEEN start_date AND end_date", "active").
+		Pluck("user_id", &subscriberIDs)
+
+	// Convert userIDs from uint to string for the notification system
+	var subscriberIDStrings []string
+	for _, id := range subscriberIDs {
+		subscriberIDStrings = append(subscriberIDStrings, id)
+	}
+
+	// Get user information for better notification content
+	var user models.User
+	h.db.First(&user, userID)
+
+	// Create notification data for deep linking
+	notificationData := map[string]interface{}{
+		"type":      "new_signal",
+		"signalId":  signal.ID,
+		"creatorId": userID,
+		"pair":      signal.Pair,
+		"action":    signal.Action,
+	}
+
+	// Prepare notification content
+	title := fmt.Sprintf("New %s Signal for %s", signal.Action, signal.Pair)
+	body := fmt.Sprintf("%s by %s", signal.Commentary, user.FullName)
+	if len(body) > 100 {
+		body = body[:97] + "..."
+	}
+
+	// Send the notification in the background
+	go func() {
+		success, err := h.notificationSender.BroadcastNotification(
+			title,
+			body,
+			notificationData,
+			subscriberIDStrings,
+		)
+
+		if !success || err != nil {
+			log.Printf("Failed to send signal notification: %v", err)
+		}
+	}()
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(signal)
 }
-
-
-
 // Define a custom response structure that only includes the fields you want
 type SignalWithUserInfo struct {
-    ID          uint      `json:"id"`
-    CreatedAt   time.Time `json:"created_at"`
-    UpdatedAt   time.Time `json:"updated_at"`
-    Pair        string    `json:"pair"`
-    Action      string    `json:"action"`
-    StopLoss    float64   `json:"stop_loss"`
-    TakeProfits []float64 `json:"take_profits"`
-    Commentary  string    `json:"commentary"`
-	Outcome		string	  `json:"outcome"`
-    UserID      uint      `json:"user_id"`
-    UserFullName string    `json:"user_full_name"`
+	ID           uint      `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Pair         string    `json:"pair"`
+	Action       string    `json:"action"`
+	StopLoss     float64   `json:"stop_loss"`
+	TakeProfits  []float64 `json:"take_profits"`
+	Commentary   string    `json:"commentary"`
+	Outcome      string    `json:"outcome"`
+	UserID       uint      `json:"user_id"`
+	UserFullName string    `json:"user_full_name"`
 }
 
 // In your GetSignals function
 func (h *SignalHandler) GetSignals(w http.ResponseWriter, r *http.Request) {
-    var signals []models.Signal
-    
-    // Parse pagination parameters
-    page, perPage, err := ParsePaginationParams(r)
-    if err != nil {
-        http.Error(w, err.Error(), http.StatusBadRequest)
-        return
-    }
-    
-    // Calculate offset
-    offset := (page - 1) * perPage
-    
-    // Get total count for pagination metadata
-    var totalItems int64
-    if err := h.db.Model(&models.Signal{}).Count(&totalItems).Error; err != nil {
-        http.Error(w, "Error retrieving signals count", http.StatusInternalServerError)
-        return
-    }
-    
-    if err := h.db.Preload("User").Limit(perPage).Offset(offset).Find(&signals).Error; err != nil {
-        http.Error(w, "Error retrieving signals", http.StatusInternalServerError)
-        return
-    }
-    
-    customResponse := make([]SignalWithUserInfo, len(signals))
-    for i, signal := range signals {
-        customResponse[i] = SignalWithUserInfo{
-            ID:          signal.ID,
-            CreatedAt:   signal.CreatedAt,
-            UpdatedAt:   signal.UpdatedAt,
-            Pair:        signal.Pair,
-            Action:      signal.Action,
-            StopLoss:    signal.StopLoss,
-            TakeProfits: signal.TakeProfits,
-            Commentary:  signal.Commentary,
-            Outcome:     signal.Outcome,
-            UserID:      signal.User.ID,
-            UserFullName: signal.User.FullName,
-        }
-    }
-    
-    // Calculate pagination metadata
-    totalPages := int(math.Ceil(float64(totalItems) / float64(perPage)))
-    paginationMeta := PaginationMeta{
-        CurrentPage: page,
-        PerPage:     perPage,
-        TotalItems:  totalItems,
-        TotalPages:  totalPages,
-        HasPrevious: page > 1,
-        HasNext:     page < totalPages,
-    }
-    
-    // Prepare response
-    response := PaginatedResponse{
-        Data:       customResponse,
-        Pagination: paginationMeta,
-    }
-    
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(response)
+	var signals []models.Signal
+
+	// Parse pagination parameters
+	page, perPage, err := ParsePaginationParams(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Calculate offset
+	offset := (page - 1) * perPage
+
+	// Get total count for pagination metadata
+	var totalItems int64
+	if err := h.db.Model(&models.Signal{}).Count(&totalItems).Error; err != nil {
+		http.Error(w, "Error retrieving signals count", http.StatusInternalServerError)
+		return
+	}
+
+	if err := h.db.Preload("User").Limit(perPage).Offset(offset).Find(&signals).Error; err != nil {
+		http.Error(w, "Error retrieving signals", http.StatusInternalServerError)
+		return
+	}
+
+	customResponse := make([]SignalWithUserInfo, len(signals))
+	for i, signal := range signals {
+		customResponse[i] = SignalWithUserInfo{
+			ID:           signal.ID,
+			CreatedAt:    signal.CreatedAt,
+			UpdatedAt:    signal.UpdatedAt,
+			Pair:         signal.Pair,
+			Action:       signal.Action,
+			StopLoss:     signal.StopLoss,
+			TakeProfits:  signal.TakeProfits,
+			Commentary:   signal.Commentary,
+			Outcome:      signal.Outcome,
+			UserID:       signal.User.ID,
+			UserFullName: signal.User.FullName,
+		}
+	}
+
+	// Calculate pagination metadata
+	totalPages := int(math.Ceil(float64(totalItems) / float64(perPage)))
+	paginationMeta := PaginationMeta{
+		CurrentPage: page,
+		PerPage:     perPage,
+		TotalItems:  totalItems,
+		TotalPages:  totalPages,
+		HasPrevious: page > 1,
+		HasNext:     page < totalPages,
+	}
+
+	// Prepare response
+	response := PaginatedResponse{
+		Data:       customResponse,
+		Pagination: paginationMeta,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
-
-
 
 // GetSignalByID retrieves a specific signal by ID
 func (h *SignalHandler) GetSignalByID(w http.ResponseWriter, r *http.Request) {
@@ -224,23 +470,22 @@ func (h *SignalHandler) GetSignalByID(w http.ResponseWriter, r *http.Request) {
 
 	// Structuring the response
 	response := SignalWithUserInfo{
-		ID:          signal.ID,
-		CreatedAt:   signal.CreatedAt,
-		UpdatedAt:   signal.UpdatedAt,
-		Pair:        signal.Pair,
-		Action:      signal.Action,
-		StopLoss:    signal.StopLoss,
-		TakeProfits: signal.TakeProfits,
-		Commentary:  signal.Commentary,
-		Outcome:     signal.Outcome,
-		UserID:      signal.User.ID,
+		ID:           signal.ID,
+		CreatedAt:    signal.CreatedAt,
+		UpdatedAt:    signal.UpdatedAt,
+		Pair:         signal.Pair,
+		Action:       signal.Action,
+		StopLoss:     signal.StopLoss,
+		TakeProfits:  signal.TakeProfits,
+		Commentary:   signal.Commentary,
+		Outcome:      signal.Outcome,
+		UserID:       signal.User.ID,
 		UserFullName: signal.User.FullName,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
-
 
 // UpdateSignal updates an existing signal
 func (h *SignalHandler) UpdateSignal(w http.ResponseWriter, r *http.Request) {
@@ -275,6 +520,9 @@ func (h *SignalHandler) UpdateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if outcome is being updated
+	outcomeChanged := signal.Outcome != updatedSignal.Outcome && updatedSignal.Outcome != ""
+
 	// Update signal fields
 	signal.Pair = updatedSignal.Pair
 	signal.Action = updatedSignal.Action
@@ -286,6 +534,63 @@ func (h *SignalHandler) UpdateSignal(w http.ResponseWriter, r *http.Request) {
 	if err := h.db.Save(&signal).Error; err != nil {
 		http.Error(w, "Error updating signal", http.StatusInternalServerError)
 		return
+	}
+
+	// If outcome has been updated, send notification to subscribers
+	if outcomeChanged {
+		// Get users with active signal subscriptions
+		var subscriberIDs []string
+		h.db.Model(&models.SignalSubscription{}).
+			Where("status = ? AND NOW() BETWEEN start_date AND end_date", "active").
+			Pluck("user_id", &subscriberIDs)
+
+		// Convert userIDs from uint to string for the notification system
+		var subscriberIDStrings []string
+		for _, id := range subscriberIDs {
+			subscriberIDStrings = append(subscriberIDStrings, id)
+		}
+
+		// Get user information for better notification content
+		var user models.User
+		h.db.First(&user, userID)
+
+		// Prepare notification content based on outcome
+		title := fmt.Sprintf("Signal Outcome Update: %s", signal.Pair)
+		var body string
+
+		switch updatedSignal.Outcome {
+		case "win":
+			body = fmt.Sprintf("✅ %s signal for %s was successful", signal.Action, signal.Pair)
+		case "loss":
+			body = fmt.Sprintf("❌ %s signal for %s hit stop loss", signal.Action, signal.Pair)
+		case "partial":
+			body = fmt.Sprintf("⚠️ %s signal for %s had partial profit", signal.Action, signal.Pair)
+		default:
+			body = fmt.Sprintf("Signal for %s has been updated to %s", signal.Pair, updatedSignal.Outcome)
+		}
+
+		// Create notification data for deep linking
+		notificationData := map[string]interface{}{
+			"type":     "signal_outcome",
+			"signalId": signal.ID,
+			"outcome":  updatedSignal.Outcome,
+			"pair":     signal.Pair,
+			"action":   signal.Action,
+		}
+
+		// Send the notification in the background
+		go func() {
+			success, err := h.notificationSender.BroadcastNotification(
+				title,
+				body,
+				notificationData,
+				subscriberIDStrings,
+			)
+
+			if !success || err != nil {
+				log.Printf("Failed to send signal outcome notification: %v", err)
+			}
+		}()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -355,16 +660,16 @@ func (h *SignalHandler) GetSignalsByUserID(w http.ResponseWriter, r *http.Reques
 	customResponse := make([]SignalWithUserInfo, len(signals))
 	for i, signal := range signals {
 		customResponse[i] = SignalWithUserInfo{
-			ID:          signal.ID,
-			CreatedAt:   signal.CreatedAt,
-			UpdatedAt:   signal.UpdatedAt,
-			Pair:        signal.Pair,
-			Action:      signal.Action,
-			StopLoss:    signal.StopLoss,
-			TakeProfits: signal.TakeProfits,
-			Commentary:  signal.Commentary,
-			Outcome:     signal.Outcome,
-			UserID:      signal.User.ID,
+			ID:           signal.ID,
+			CreatedAt:    signal.CreatedAt,
+			UpdatedAt:    signal.UpdatedAt,
+			Pair:         signal.Pair,
+			Action:       signal.Action,
+			StopLoss:     signal.StopLoss,
+			TakeProfits:  signal.TakeProfits,
+			Commentary:   signal.Commentary,
+			Outcome:      signal.Outcome,
+			UserID:       signal.User.ID,
 			UserFullName: signal.User.FullName,
 		}
 	}
@@ -423,16 +728,16 @@ func (h *SignalHandler) GetSignalsByPair(w http.ResponseWriter, r *http.Request)
 	customResponse := make([]SignalWithUserInfo, len(signals))
 	for i, signal := range signals {
 		customResponse[i] = SignalWithUserInfo{
-			ID:          signal.ID,
-			CreatedAt:   signal.CreatedAt,
-			UpdatedAt:   signal.UpdatedAt,
-			Pair:        signal.Pair,
-			Action:      signal.Action,
-			StopLoss:    signal.StopLoss,
-			TakeProfits: signal.TakeProfits,
-			Commentary:  signal.Commentary,
-			Outcome:     signal.Outcome,
-			UserID:      signal.User.ID,
+			ID:           signal.ID,
+			CreatedAt:    signal.CreatedAt,
+			UpdatedAt:    signal.UpdatedAt,
+			Pair:         signal.Pair,
+			Action:       signal.Action,
+			StopLoss:     signal.StopLoss,
+			TakeProfits:  signal.TakeProfits,
+			Commentary:   signal.Commentary,
+			Outcome:      signal.Outcome,
+			UserID:       signal.User.ID,
 			UserFullName: signal.User.FullName,
 		}
 	}
@@ -491,16 +796,16 @@ func (h *SignalHandler) GetSignalsByAction(w http.ResponseWriter, r *http.Reques
 	customResponse := make([]SignalWithUserInfo, len(signals))
 	for i, signal := range signals {
 		customResponse[i] = SignalWithUserInfo{
-			ID:          signal.ID,
-			CreatedAt:   signal.CreatedAt,
-			UpdatedAt:   signal.UpdatedAt,
-			Pair:        signal.Pair,
-			Action:      signal.Action,
-			StopLoss:    signal.StopLoss,
-			TakeProfits: signal.TakeProfits,
-			Commentary:  signal.Commentary,
-			Outcome:     signal.Outcome,
-			UserID:      signal.User.ID,
+			ID:           signal.ID,
+			CreatedAt:    signal.CreatedAt,
+			UpdatedAt:    signal.UpdatedAt,
+			Pair:         signal.Pair,
+			Action:       signal.Action,
+			StopLoss:     signal.StopLoss,
+			TakeProfits:  signal.TakeProfits,
+			Commentary:   signal.Commentary,
+			Outcome:      signal.Outcome,
+			UserID:       signal.User.ID,
 			UserFullName: signal.User.FullName,
 		}
 	}
@@ -525,9 +830,6 @@ func (h *SignalHandler) GetSignalsByAction(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
-
-
-
 
 func (h *SignalHandler) GetSignalsByOutcome(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
@@ -561,16 +863,16 @@ func (h *SignalHandler) GetSignalsByOutcome(w http.ResponseWriter, r *http.Reque
 	customResponse := make([]SignalWithUserInfo, len(signals))
 	for i, signal := range signals {
 		customResponse[i] = SignalWithUserInfo{
-			ID:          signal.ID,
-			CreatedAt:   signal.CreatedAt,
-			UpdatedAt:   signal.UpdatedAt,
-			Pair:        signal.Pair,
-			Action:      signal.Action,
-			StopLoss:    signal.StopLoss,
-			TakeProfits: signal.TakeProfits,
-			Commentary:  signal.Commentary,
-			Outcome:     signal.Outcome,
-			UserID:      signal.User.ID,
+			ID:           signal.ID,
+			CreatedAt:    signal.CreatedAt,
+			UpdatedAt:    signal.UpdatedAt,
+			Pair:         signal.Pair,
+			Action:       signal.Action,
+			StopLoss:     signal.StopLoss,
+			TakeProfits:  signal.TakeProfits,
+			Commentary:   signal.Commentary,
+			Outcome:      signal.Outcome,
+			UserID:       signal.User.ID,
 			UserFullName: signal.User.FullName,
 		}
 	}
@@ -595,9 +897,6 @@ func (h *SignalHandler) GetSignalsByOutcome(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
-
-
-
 
 // CreateBatchSignals creates multiple signals at once
 func (h *SignalHandler) CreateBatchSignals(w http.ResponseWriter, r *http.Request) {
@@ -632,6 +931,47 @@ func (h *SignalHandler) CreateBatchSignals(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "Error creating signals: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Get users with active signal subscriptions
+	var subscriberIDs []string
+	h.db.Model(&models.SignalSubscription{}).
+		Where("status = ? AND NOW() BETWEEN start_date AND end_date", "active").
+		Pluck("user_id", &subscriberIDs)
+
+	// Convert userIDs from uint to string for the notification system
+	var subscriberIDStrings []string
+	for _, id := range subscriberIDs {
+		subscriberIDStrings = append(subscriberIDStrings, id)
+	}
+
+	// Get user information for better notification content
+	var user models.User
+	h.db.First(&user, userID)
+
+	// Send a single notification about the batch
+	title := fmt.Sprintf("New Batch of Trading Signals")
+	body := fmt.Sprintf("%d new signals from %s", len(signals), user.FullName)
+
+	// Create notification data
+	notificationData := map[string]interface{}{
+		"type":      "new_signal_batch",
+		"count":     len(signals),
+		"creatorId": userID,
+	}
+
+	// Send the notification in the background
+	go func() {
+		success, err := h.notificationSender.BroadcastNotification(
+			title,
+			body,
+			notificationData,
+			subscriberIDStrings,
+		)
+
+		if !success || err != nil {
+			log.Printf("Failed to send batch signal notification: %v", err)
+		}
+	}()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)

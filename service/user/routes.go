@@ -58,6 +58,12 @@ func (h *Handler) RegisterRoutes(router *mux.Router) {
 	router.HandleFunc("/experts/expertise/{expertise}", h.GetExpertsByExpertise).Methods("GET")
     router.HandleFunc("/images/{filename}", h.ServeImage).Methods("GET")
     router.HandleFunc("/certifications/{filename}", h.ServeCertification).Methods("GET")
+    router.HandleFunc("/experts/{id}/rate", h.RateExpert).Methods("POST")
+    router.HandleFunc("/experts/{id}/ratings", h.GetExpertRatings).Methods("GET") 
+    router.HandleFunc("/ratings/{id}", h.UpdateRating).Methods("PUT")
+    router.HandleFunc("/ratings/{id}", h.DeleteRating).Methods("DELETE")
+    router.HandleFunc("/users/{id}/ratings", h.GetUserRatings).Methods("GET")
+
 
     fileServer := http.FileServer(http.Dir("uploads/images"))
     router.PathPrefix("/images/").Handler(http.StripPrefix("/images/", fileServer))
@@ -1357,4 +1363,437 @@ func (h *Handler) GetExpertsByExpertise(w http.ResponseWriter, r *http.Request) 
 		"page_size":   pageSize,
 		"total_pages": (total + int64(pageSize) - 1) / int64(pageSize),
 	})
+}
+
+
+
+
+func (h *Handler) RateExpert(w http.ResponseWriter, r *http.Request) {
+    // Parse expert ID from URL
+    vars := mux.Vars(r)
+    expertID, err := strconv.ParseUint(vars["id"], 10, 64)
+    if err != nil {
+        http.Error(w, "Invalid expert ID", http.StatusBadRequest)
+        return
+    }
+
+    // Parse request body
+    var ratingRequest struct {
+        UserID  uint    `json:"user_id"`
+        Rating  float64 `json:"rating"`
+        Comment string  `json:"comment"`
+    }
+    
+    if err := json.NewDecoder(r.Body).Decode(&ratingRequest); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
+
+    // Validate rating value
+    if ratingRequest.Rating < 1 || ratingRequest.Rating > 5 {
+        http.Error(w, "Rating must be between 1 and 5", http.StatusBadRequest)
+        return
+    }
+
+    // Validate required fields
+    if ratingRequest.UserID == 0 {
+        http.Error(w, "User ID is required", http.StatusBadRequest)
+        return
+    }
+
+    // Check if expert exists
+    var expert models.Expert
+    if err := h.db.First(&expert, expertID).Error; err != nil {
+        http.Error(w, "Expert not found", http.StatusNotFound)
+        return
+    }
+
+    // Check if user exists
+    var user models.User
+    if err := h.db.First(&user, ratingRequest.UserID).Error; err != nil {
+        http.Error(w, "User not found", http.StatusNotFound)
+        return
+    }
+
+    // Prevent self-rating
+    if expert.UserID == ratingRequest.UserID {
+        http.Error(w, "Users cannot rate themselves", http.StatusBadRequest)
+        return
+    }
+
+    // Begin transaction
+    tx := h.db.Begin()
+
+    // Check if user has already rated this expert
+    var existingRating models.Rating
+    result := tx.Where("user_id = ? AND expert_id = ?", ratingRequest.UserID, expertID).First(&existingRating)
+    
+    if result.Error == nil {
+        // Update existing rating
+        existingRating.Rating = ratingRequest.Rating
+        existingRating.Comment = ratingRequest.Comment
+        
+        if err := tx.Save(&existingRating).Error; err != nil {
+            tx.Rollback()
+            http.Error(w, "Error updating rating", http.StatusInternalServerError)
+            return
+        }
+    } else if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+        // Create new rating
+        newRating := models.Rating{
+            UserID:   ratingRequest.UserID,
+            ExpertID: uint(expertID),
+            Rating:   ratingRequest.Rating,
+            Comment:  ratingRequest.Comment,
+        }
+        
+        if err := tx.Create(&newRating).Error; err != nil {
+            tx.Rollback()
+            http.Error(w, "Error creating rating", http.StatusInternalServerError)
+            return
+        }
+    } else {
+        tx.Rollback()
+        http.Error(w, "Database error", http.StatusInternalServerError)
+        return
+    }
+
+    // Update expert's average rating and total count
+    if err := h.updateExpertRatingStats(tx, uint(expertID)); err != nil {
+        tx.Rollback()
+        http.Error(w, "Error updating expert rating statistics", http.StatusInternalServerError)
+        return
+    }
+
+    // Commit transaction
+    if err := tx.Commit().Error; err != nil {
+        http.Error(w, "Error saving rating", http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{
+        "message": "Rating submitted successfully",
+    })
+}
+
+// GetExpertRatings retrieves all ratings for a specific expert
+func (h *Handler) GetExpertRatings(w http.ResponseWriter, r *http.Request) {
+    // Parse expert ID from URL
+    vars := mux.Vars(r)
+    expertID, err := strconv.ParseUint(vars["id"], 10, 64)
+    if err != nil {
+        http.Error(w, "Invalid expert ID", http.StatusBadRequest)
+        return
+    }
+
+    // Parse pagination parameters
+    page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+    if page < 1 {
+        page = 1
+    }
+    pageSize := 10
+
+    // Check if expert exists
+    var expert models.Expert
+    if err := h.db.First(&expert, expertID).Error; err != nil {
+        http.Error(w, "Expert not found", http.StatusNotFound)
+        return
+    }
+
+    // Get total count
+    var total int64
+    h.db.Model(&models.Rating{}).Where("expert_id = ?", expertID).Count(&total)
+
+    // Get ratings with user information
+    var ratings []models.Rating
+    result := h.db.Where("expert_id = ?", expertID).
+        Preload("User").
+        Order("created_at DESC").
+        Offset((page - 1) * pageSize).
+        Limit(pageSize).
+        Find(&ratings)
+
+    if result.Error != nil {
+        http.Error(w, "Error retrieving ratings", http.StatusInternalServerError)
+        return
+    }
+
+    // Prepare response
+    var ratingResponses []map[string]interface{}
+    for _, rating := range ratings {
+        ratingData := map[string]interface{}{
+            "id":         rating.ID,
+            "rating":     rating.Rating,
+            "comment":    rating.Comment,
+            "created_at": rating.CreatedAt,
+            "updated_at": rating.UpdatedAt,
+        }
+        
+        if rating.User != nil {
+            ratingData["user"] = map[string]interface{}{
+                "id":        rating.User.ID,
+                "full_name": rating.User.FullName,
+                "profile_picture_path": rating.User.ProfilePicturePath,
+            }
+        }
+        
+        ratingResponses = append(ratingResponses, ratingData)
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "ratings":      ratingResponses,
+        "total":        total,
+        "page":         page,
+        "page_size":    pageSize,
+        "total_pages":  (total + int64(pageSize) - 1) / int64(pageSize),
+        "average_rating": expert.AverageRating,
+        "total_ratings":  expert.TotalRatings,
+    })
+}
+
+// UpdateRating allows users to update their existing rating
+func (h *Handler) UpdateRating(w http.ResponseWriter, r *http.Request) {
+    // Parse rating ID from URL
+    vars := mux.Vars(r)
+    ratingID, err := strconv.ParseUint(vars["id"], 10, 64)
+    if err != nil {
+        http.Error(w, "Invalid rating ID", http.StatusBadRequest)
+        return
+    }
+
+    // Parse request body
+    var updateRequest struct {
+        Rating  float64 `json:"rating"`
+        Comment string  `json:"comment"`
+        UserID  uint    `json:"user_id"` // For authorization
+    }
+    
+    if err := json.NewDecoder(r.Body).Decode(&updateRequest); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
+
+    // Validate rating value
+    if updateRequest.Rating < 1 || updateRequest.Rating > 5 {
+        http.Error(w, "Rating must be between 1 and 5", http.StatusBadRequest)
+        return
+    }
+
+    // Find existing rating
+    var rating models.Rating
+    if err := h.db.First(&rating, ratingID).Error; err != nil {
+        http.Error(w, "Rating not found", http.StatusNotFound)
+        return
+    }
+
+    // Check if user owns this rating
+    if rating.UserID != updateRequest.UserID {
+        http.Error(w, "Unauthorized to update this rating", http.StatusForbidden)
+        return
+    }
+
+    // Begin transaction
+    tx := h.db.Begin()
+
+    // Update rating
+    rating.Rating = updateRequest.Rating
+    rating.Comment = updateRequest.Comment
+    
+    if err := tx.Save(&rating).Error; err != nil {
+        tx.Rollback()
+        http.Error(w, "Error updating rating", http.StatusInternalServerError)
+        return
+    }
+
+    // Update expert's rating statistics
+    if err := h.updateExpertRatingStats(tx, rating.ExpertID); err != nil {
+        tx.Rollback()
+        http.Error(w, "Error updating expert rating statistics", http.StatusInternalServerError)
+        return
+    }
+
+    // Commit transaction
+    if err := tx.Commit().Error; err != nil {
+        http.Error(w, "Error saving rating update", http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{
+        "message": "Rating updated successfully",
+    })
+}
+
+// DeleteRating allows users to delete their rating
+func (h *Handler) DeleteRating(w http.ResponseWriter, r *http.Request) {
+    // Parse rating ID from URL
+    vars := mux.Vars(r)
+    ratingID, err := strconv.ParseUint(vars["id"], 10, 64)
+    if err != nil {
+        http.Error(w, "Invalid rating ID", http.StatusBadRequest)
+        return
+    }
+
+    // Get user ID from query parameter (in production, this should come from JWT token)
+    userIDParam := r.URL.Query().Get("user_id")
+    userID, err := strconv.ParseUint(userIDParam, 10, 64)
+    if err != nil {
+        http.Error(w, "Valid user ID required", http.StatusBadRequest)
+        return
+    }
+
+    // Find existing rating
+    var rating models.Rating
+    if err := h.db.First(&rating, ratingID).Error; err != nil {
+        http.Error(w, "Rating not found", http.StatusNotFound)
+        return
+    }
+
+    // Check if user owns this rating
+    if rating.UserID != uint(userID) {
+        http.Error(w, "Unauthorized to delete this rating", http.StatusForbidden)
+        return
+    }
+
+    // Begin transaction
+    tx := h.db.Begin()
+
+    // Delete rating
+    if err := tx.Delete(&rating).Error; err != nil {
+        tx.Rollback()
+        http.Error(w, "Error deleting rating", http.StatusInternalServerError)
+        return
+    }
+
+    // Update expert's rating statistics
+    if err := h.updateExpertRatingStats(tx, rating.ExpertID); err != nil {
+        tx.Rollback()
+        http.Error(w, "Error updating expert rating statistics", http.StatusInternalServerError)
+        return
+    }
+
+    // Commit transaction
+    if err := tx.Commit().Error; err != nil {
+        http.Error(w, "Error saving rating deletion", http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{
+        "message": "Rating deleted successfully",
+    })
+}
+
+// GetUserRatings retrieves all ratings given by a specific user
+func (h *Handler) GetUserRatings(w http.ResponseWriter, r *http.Request) {
+    // Parse user ID from URL
+    vars := mux.Vars(r)
+    userID, err := strconv.ParseUint(vars["id"], 10, 64)
+    if err != nil {
+        http.Error(w, "Invalid user ID", http.StatusBadRequest)
+        return
+    }
+
+    // Parse pagination parameters
+    page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+    if page < 1 {
+        page = 1
+    }
+    pageSize := 10
+
+    // Check if user exists
+    var user models.User
+    if err := h.db.First(&user, userID).Error; err != nil {
+        http.Error(w, "User not found", http.StatusNotFound)
+        return
+    }
+
+    // Get total count
+    var total int64
+    h.db.Model(&models.Rating{}).Where("user_id = ?", userID).Count(&total)
+
+    // Get ratings with expert information
+    var ratings []models.Rating
+    result := h.db.Where("user_id = ?", userID).
+        Preload("Expert").
+        Preload("Expert.User").
+        Order("created_at DESC").
+        Offset((page - 1) * pageSize).
+        Limit(pageSize).
+        Find(&ratings)
+
+    if result.Error != nil {
+        http.Error(w, "Error retrieving ratings", http.StatusInternalServerError)
+        return
+    }
+
+    // Prepare response
+    var ratingResponses []map[string]interface{}
+    for _, rating := range ratings {
+        ratingData := map[string]interface{}{
+            "id":         rating.ID,
+            "rating":     rating.Rating,
+            "comment":    rating.Comment,
+            "created_at": rating.CreatedAt,
+            "updated_at": rating.UpdatedAt,
+        }
+        
+        if rating.Expert != nil {
+            expertData := map[string]interface{}{
+                "id":        rating.Expert.ID,
+                "expertise": rating.Expert.Expertise,
+                "bio":       rating.Expert.Bio,
+                "verified":  rating.Expert.Verified,
+            }
+            
+            if rating.Expert.User != nil {
+                expertData["user"] = map[string]interface{}{
+                    "id":        rating.Expert.User.ID,
+                    "full_name": rating.Expert.User.FullName,
+                    "profile_picture_path": rating.Expert.User.ProfilePicturePath,
+                }
+            }
+            
+            ratingData["expert"] = expertData
+        }
+        
+        ratingResponses = append(ratingResponses, ratingData)
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "ratings":     ratingResponses,
+        "total":       total,
+        "page":        page,
+        "page_size":   pageSize,
+        "total_pages": (total + int64(pageSize) - 1) / int64(pageSize),
+    })
+}
+
+// Helper function to update expert rating statistics
+func (h *Handler) updateExpertRatingStats(tx *gorm.DB, expertID uint) error {
+    var stats struct {
+        AverageRating float64
+        TotalRatings  int64
+    }
+
+    // Calculate average rating and total count
+    err := tx.Model(&models.Rating{}).
+        Select("AVG(rating) as average_rating, COUNT(*) as total_ratings").
+        Where("expert_id = ?", expertID).
+        Scan(&stats).Error
+
+    if err != nil {
+        return err
+    }
+
+    // Update expert record
+    return tx.Model(&models.Expert{}).
+        Where("id = ?", expertID).
+        Updates(map[string]interface{}{
+            "average_rating": stats.AverageRating,
+            "total_ratings":  stats.TotalRatings,
+        }).Error
 }
